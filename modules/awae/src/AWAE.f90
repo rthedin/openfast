@@ -203,7 +203,7 @@ subroutine LowResGridCalcOutput(n, u, p, y, m, errStat, errMsg)
    real(ReKi)          :: Vave_amb_low_norm, Vamb_lowpol_tmp(3), Vdist_lowpol_tmp(3), Vamb_low_tmp(3,8)
    real(ReKi)          :: delta, deltad
    real(ReKi)          :: wsum_tmp, w
-   real(ReKi)          :: tmp_x,tmp_y,tmp_z !, tm1, tm2
+   real(ReKi)          :: tmp_x,tmp_y,tmp_z,  tm1, tm2
    real(ReKi)          :: xxplane(3), xyplane(3), yyplane(3), yxplane(3), psi_polar, r_polar, p_polar(3)
    real(ReKi)          :: yzplane_Y(3), xyplane_norm
    real(ReKi)          :: xplane_sq, yplane_sq, xysq_Z(3), xzplane_X(3)
@@ -227,9 +227,10 @@ subroutine LowResGridCalcOutput(n, u, p, y, m, errStat, errMsg)
    tmpPln =  min(p%NumPlanes-1, n+1)
 
    
-!#ifdef _OPENMP  
-!   tm1 =  omp_get_wtime() 
-!#endif 
+#ifdef _OPENMP  
+   tm1 =  omp_get_wtime() 
+   write(*,*)  '   AWAE:LowResGridCalcOutput: Starting..'
+#endif 
 
    maxN_wake = p%NumTurbines*( p%NumPlanes-1 )
    ! Temporary variables needed by OpenMP 
@@ -555,11 +556,10 @@ subroutine LowResGridCalcOutput(n, u, p, y, m, errStat, errMsg)
       end do ! np, tmpPln
    end do ! nt, turbines
 
-!#ifdef _OPENMP  
-!   tm2 =  omp_get_wtime() 
-!   write(*,*)  'Total AWAE:LowResGridCalcOutput using '//trim(num2lstr(tm2-tm1))//' seconds'
-
-!#endif 
+#ifdef _OPENMP  
+   tm2 =  omp_get_wtime() 
+   write(*,*)  'AWAE:LowResGridCalcOutput: Done. Took '//trim(num2lstr(tm2-tm1))//' s'
+#endif 
 
    if (allocated(tmp_xhat_plane)) deallocate(tmp_xhat_plane)
    if (allocated(tmp_yhat_plane)) deallocate(tmp_yhat_plane)
@@ -603,6 +603,7 @@ subroutine HighResGridCalcOutput(n, u, p, y, m, errStat, errMsg)
    real(ReKi)          :: p_tmp_plane(3)
    real(ReKi)          :: tmp_vec(3)
    real(ReKi)          :: delta, deltad
+   real(ReKi)          :: tm1, tm2
    real(ReKi), ALLOCATABLE :: tmp_xhat_plane(:,:), tmp_yhat_plane(:,:), tmp_zhat_plane(:,:)
    real(ReKi), ALLOCATABLE :: tmp_Vx_wake(:), tmp_Vz_wake(:), tmp_Vy_wake(:)
    integer(IntKi)      :: np1
@@ -615,6 +616,12 @@ subroutine HighResGridCalcOutput(n, u, p, y, m, errStat, errMsg)
    character(*), parameter   :: RoutineName = 'HighResGridCalcOutput'
    errStat = ErrID_None
    errMsg  = ""
+
+
+   #ifdef _OPENMP  
+      tm1 =  omp_get_wtime() 
+      write(*,*)  '   AWAE:HighResGridCalcOutput: Starting (serial).'
+   #endif 
 
    maxPln =  min(n,p%NumPlanes-2)
 
@@ -785,6 +792,11 @@ subroutine HighResGridCalcOutput(n, u, p, y, m, errStat, errMsg)
    if (allocated(tmp_Vx_wake))    deallocate(tmp_Vx_wake)
    if (allocated(tmp_Vy_wake))    deallocate(tmp_Vy_wake)
    if (allocated(tmp_Vz_wake))    deallocate(tmp_Vz_wake)
+
+   #ifdef _OPENMP  
+      tm2 =  omp_get_wtime() 
+      write(*,*)  '   AWAE:HighResGridCalcOutput: Done (serial). Total '//trim(num2lstr(tm2-tm1))//' s'
+   #endif 
 
 end subroutine HighResGridCalcOutput
 
@@ -1332,16 +1344,17 @@ subroutine AWAE_UpdateStates( t, n, u, p, x, xd, z, OtherState, m, errStat, errM
    integer(intKi)                               :: errStat2          ! temporary Error status
    character(ErrMsgLen)                         :: errMsg2           ! temporary Error message
    character(*), parameter                      :: RoutineName = 'AWAE_UpdateStates'
-!   real(DbKi)          :: t1, t2
+   real(DbKi)                                   :: t1, t2, t1_lowres, t2_lowres, t1_highres, t2_highres
    integer(IntKi)                               :: n_high_low, nt, n_hl, i,j,k,c
    
    errStat = ErrID_None
    errMsg  = ""
    
    ! Read the ambient wind data that is needed for t+dt, i.e., n+1
-!#ifdef _OPENMP
-!   t1 = omp_get_wtime()  
-!#endif 
+#ifdef _OPENMP
+   t1 = omp_get_wtime()  
+   write(*,*)  'AWAE:AWEA_UpdateStates: Starting'
+#endif 
    
    if ( (n+1) == (p%NumDT-1) ) then
       n_high_low = 0
@@ -1350,19 +1363,28 @@ subroutine AWAE_UpdateStates( t, n, u, p, x, xd, z, OtherState, m, errStat, errM
    end if
 
    if ( p%Mod_AmbWind == 1 ) then
+   #ifdef _OPENMP
+       t1_lowres = omp_get_wtime()  
+       write(*,*) '   AWEA:AWAE_UpdateStates: Starting Low Res data processing'
+   #endif 
          ! read from file the ambient flow for the n+1 time step
       call ReadLowResWindFile(n+1, p, m%Vamb_Low, errStat2, errMsg2)
          call SetErrStat( ErrStat2, ErrMsg2, errStat, errMsg, RoutineName )
          if (errStat >= AbortErrLev) return 
-   !#ifdef _OPENMP
-   !   t2 = omp_get_wtime()      
-   !   write(*,*) '        AWAE_UpdateStates: Time spent reading Low Res data : '//trim(num2lstr(t2-t1))//' seconds'            
-   !#endif   
+   #ifdef _OPENMP
+      t2_lowres = omp_get_wtime()      
+      write(*,*) '   AWEA:AWAE_UpdateStates: Low Res data (ReadLowResWindFile loop): '//trim(num2lstr(t2_lowres-t1_lowres))//' s'            
+   #endif 
       
+   #ifdef _OPENMP
+      t1_highres = omp_get_wtime()  
+     write(*,*) '   AWEA:AWAE_UpdateStates: Starting High Res data processing'
+   #endif 
       !$OMP PARALLEL DO DEFAULT(Shared) PRIVATE(nt, n_hl, errStat2, errMsg2) !Private(nt,tm2,tm3)
       do nt = 1,p%NumTurbines
          do n_hl=0, n_high_low
                ! read from file the ambient flow for the current time step
+            write(*,*) '      Reading turbine '//trim(num2lstr(nt))//', time '//trim(num2lstr(n_hl))//' (of '//trim(num2lstr(n_high_low))//')'
             call ReadHighResWindFile(nt, (n+1)*p%n_high_low + n_hl, p, m%Vamb_high(nt)%data(:,:,:,:,n_hl), errStat2, errMsg2)
             if (ErrStat2 >= AbortErrLev) then
                !$OMP CRITICAL  ! Needed to avoid data race on ErrStat and ErrMsg
@@ -1373,6 +1395,11 @@ subroutine AWAE_UpdateStates( t, n, u, p, x, xd, z, OtherState, m, errStat, errM
       end do
       !$OMP END PARALLEL DO  
       if (errStat >= AbortErrLev) return 
+
+      #ifdef _OPENMP
+         t2_highres = omp_get_wtime()      
+         write(*,*) '   AWEA:AWAE_UpdateStates: High Res data (ReadHighResWindFile loop) : '//trim(num2lstr(t2_highres-t1_highres))//' s'
+      #endif 
 
    else ! p%Mod_AmbWind == 2 .or. 3
 
@@ -1439,10 +1466,10 @@ subroutine AWAE_UpdateStates( t, n, u, p, x, xd, z, OtherState, m, errStat, errM
 
    end if
 
-!#ifdef _OPENMP
-!   t1 = omp_get_wtime()      
-!   write(*,*) '        AWAE_UpdateStates: Time spent reading High Res data : '//trim(num2lstr(t1-t2))//' seconds'             
-!#endif 
+#ifdef _OPENMP
+   t2 = omp_get_wtime()  
+   write(*,*)  'AWAE:AWEA_UpdateStates: Done. Total time: '//trim(num2lstr(t2-t1))//' s'
+#endif 
    
 end subroutine AWAE_UpdateStates
 

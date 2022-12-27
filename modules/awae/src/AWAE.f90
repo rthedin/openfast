@@ -227,10 +227,8 @@ subroutine LowResGridCalcOutput(n, u, p, y, m, errStat, errMsg)
    tmpPln =  min(p%NumPlanes-1, n+1)
 
    
-#ifdef _OPENMP  
    tm1 =  omp_get_wtime() 
    write(*,*)  '   AWAE:LowResGridCalcOutput: Starting..'
-#endif 
 
    maxN_wake = p%NumTurbines*( p%NumPlanes-1 )
    ! Temporary variables needed by OpenMP 
@@ -556,10 +554,8 @@ subroutine LowResGridCalcOutput(n, u, p, y, m, errStat, errMsg)
       end do ! np, tmpPln
    end do ! nt, turbines
 
-#ifdef _OPENMP  
    tm2 =  omp_get_wtime() 
-   write(*,*)  'AWAE:LowResGridCalcOutput: Done. Took '//trim(num2lstr(tm2-tm1))//' s'
-#endif 
+   write(*,*)  '    AWAE:LowResGridCalcOutput: Done. Serial Time '//trim(num2lstr(tm2-tm1))//' s'
 
    if (allocated(tmp_xhat_plane)) deallocate(tmp_xhat_plane)
    if (allocated(tmp_yhat_plane)) deallocate(tmp_yhat_plane)
@@ -618,10 +614,8 @@ subroutine HighResGridCalcOutput(n, u, p, y, m, errStat, errMsg)
    errMsg  = ""
 
 
-   #ifdef _OPENMP  
-      tm1 =  omp_get_wtime() 
-      write(*,*)  '   AWAE:HighResGridCalcOutput: Starting (serial).'
-   #endif 
+   tm1 =  omp_get_wtime() 
+   write(*,*)  '   AWAE:HighResGridCalcOutput: Starting (serial).'
 
    maxPln =  min(n,p%NumPlanes-2)
 
@@ -793,10 +787,8 @@ subroutine HighResGridCalcOutput(n, u, p, y, m, errStat, errMsg)
    if (allocated(tmp_Vy_wake))    deallocate(tmp_Vy_wake)
    if (allocated(tmp_Vz_wake))    deallocate(tmp_Vz_wake)
 
-   #ifdef _OPENMP  
-      tm2 =  omp_get_wtime() 
-      write(*,*)  '   AWAE:HighResGridCalcOutput: Done (serial). Total '//trim(num2lstr(tm2-tm1))//' s'
-   #endif 
+   tm2 =  omp_get_wtime() 
+   write(*,*)  '   AWAE:HighResGridCalcOutput: Done. Serial Time '//trim(num2lstr(tm2-tm1))//' s'
 
 end subroutine HighResGridCalcOutput
 
@@ -834,6 +826,7 @@ subroutine AWAE_Init( InitInp, u, p, x, xd, z, OtherState, y, m, Interval, InitO
    character(*), parameter                       :: RoutineName = 'AWAE_Init'
    type(InflowWind_InitInputType)                :: IfW_InitInp
    type(InflowWind_InitOutputType)               :: IfW_InitOut
+   real(DbKi)                                    :: tm1, tm2
       ! Initialize variables for this routine
 
    errStat = ErrID_None
@@ -1353,7 +1346,7 @@ subroutine AWAE_UpdateStates( t, n, u, p, x, xd, z, OtherState, m, errStat, errM
    ! Read the ambient wind data that is needed for t+dt, i.e., n+1
 #ifdef _OPENMP
    t1 = omp_get_wtime()  
-   write(*,*)  'AWAE:AWEA_UpdateStates: Starting'
+   write(*,*)  'AWAE:AWAE_US: Starting'
 #endif 
    
    if ( (n+1) == (p%NumDT-1) ) then
@@ -1365,7 +1358,7 @@ subroutine AWAE_UpdateStates( t, n, u, p, x, xd, z, OtherState, m, errStat, errM
    if ( p%Mod_AmbWind == 1 ) then
    #ifdef _OPENMP
        t1_lowres = omp_get_wtime()  
-       write(*,*) '   AWEA:AWAE_UpdateStates: Starting Low Res data processing'
+       write(*,*) '   AWAE:AWAE_US: Starting Low Res data processing'
    #endif 
          ! read from file the ambient flow for the n+1 time step
       call ReadLowResWindFile(n+1, p, m%Vamb_Low, errStat2, errMsg2)
@@ -1373,32 +1366,33 @@ subroutine AWAE_UpdateStates( t, n, u, p, x, xd, z, OtherState, m, errStat, errM
          if (errStat >= AbortErrLev) return 
    #ifdef _OPENMP
       t2_lowres = omp_get_wtime()      
-      write(*,*) '   AWEA:AWAE_UpdateStates: Low Res data (ReadLowResWindFile loop): '//trim(num2lstr(t2_lowres-t1_lowres))//' s'            
+      write(*,*) '   AWAE:AWAE_US: Done Low Res (ReadLowResWindFile loop). Par Time: '//trim(num2lstr(t2_lowres-t1_lowres))//' s'            
    #endif 
       
    #ifdef _OPENMP
       t1_highres = omp_get_wtime()  
-     write(*,*) '   AWEA:AWAE_UpdateStates: Starting High Res data processing'
+     write(*,*) '   AWAE:AWAE_US: Starting High Res data processing'
    #endif 
-      !$OMP PARALLEL DO DEFAULT(Shared) PRIVATE(nt, n_hl, errStat2, errMsg2) !Private(nt,tm2,tm3)
+      !    ---        !$OMP PARALLEL DO DEFAULT(Shared) PRIVATE(nt, n_hl, errStat2, errMsg2) !Private(nt,tm2,tm3)
+        write(*,*) '      Reading '//trim(num2lstr(p%NumTurbines))//' turbines, '//trim(num2lstr(n_high_low))//' times each ('//trim(num2lstr(p%NumTurbines*n_high_low))//' total high-res boxes)'
       do nt = 1,p%NumTurbines
          do n_hl=0, n_high_low
                ! read from file the ambient flow for the current time step
-            write(*,*) '      Reading turbine '//trim(num2lstr(nt))//', time '//trim(num2lstr(n_hl))//' (of '//trim(num2lstr(n_high_low))//')'
+            !write(*,*) '      Reading turbine '//trim(num2lstr(nt))//', time '//trim(num2lstr(n_hl))//' (of '//trim(num2lstr(n_high_low))//')'
             call ReadHighResWindFile(nt, (n+1)*p%n_high_low + n_hl, p, m%Vamb_high(nt)%data(:,:,:,:,n_hl), errStat2, errMsg2)
             if (ErrStat2 >= AbortErrLev) then
-               !$OMP CRITICAL  ! Needed to avoid data race on ErrStat and ErrMsg
+               ! ---------    !$OMP CRITICAL  ! Needed to avoid data race on ErrStat and ErrMsg
                 call SetErrStat( ErrStat2, ErrMsg2, errStat, errMsg, RoutineName )
-               !$OMP END CRITICAL
+               ! ---------  !$OMP END CRITICAL
             endif
          end do
       end do
-      !$OMP END PARALLEL DO  
+      ! ----------  !$OMP END PARALLEL DO  
       if (errStat >= AbortErrLev) return 
 
       #ifdef _OPENMP
          t2_highres = omp_get_wtime()      
-         write(*,*) '   AWEA:AWAE_UpdateStates: High Res data (ReadHighResWindFile loop) : '//trim(num2lstr(t2_highres-t1_highres))//' s'
+         write(*,*) '   AWAE:AWAE_US: Done High Res (ReadHighResWindFile loop). Par Time: '//trim(num2lstr(t2_highres-t1_highres))//' s'
       #endif 
 
    else ! p%Mod_AmbWind == 2 .or. 3
@@ -1468,7 +1462,7 @@ subroutine AWAE_UpdateStates( t, n, u, p, x, xd, z, OtherState, m, errStat, errM
 
 #ifdef _OPENMP
    t2 = omp_get_wtime()  
-   write(*,*)  'AWAE:AWEA_UpdateStates: Done. Total time: '//trim(num2lstr(t2-t1))//' s'
+   write(*,*)  'AWAE:AWAE_US: Done. Par Time: '//trim(num2lstr(t2-t1))//' s'
 #endif 
    
 end subroutine AWAE_UpdateStates
@@ -1548,7 +1542,7 @@ subroutine AWAE_CalcOutput( t, u, p, x, xd, z, OtherState, y, m, errStat, errMsg
          call ExtractSlice( XYSlice, p%OutDisWindZ(k), p%Z0_low, p%nZ_low, p%nX_low, p%nY_low, p%dZ_low, m%Vdist_low_full, m%outVizXYPlane(:,:,:,1))
             ! Create the output vtk file with naming <WindFilePath>/Low/DisXY<k>.t<n/p%WrDisSkp1>.vtk
          FileName = trim(p%OutFileVTKRoot)//".Low.DisXY"//trim(num2lstr(k))//"."//trim(Tstr)//".vtk"
-         call WrVTK_SP_header( FileName, "Low resolution, disturbed wind of XY Slice at time = "//trim(num2lstr(t))//" seconds.", Un, ErrStat2, ErrMsg2 )
+         call WrVTK_SP_header( FileName, "Low resolution, disturbed wind of XY Slice at time = "//trim(num2lstr(t))//" s", Un, ErrStat2, ErrMsg2 )
             call SetErrStat(ErrStat2, ErrMsg2, ErrStat, ErrMsg, RoutineName)
             if (ErrStat >= AbortErrLev) return
          call WrVTK_SP_vectors3D( Un, "Velocity", (/p%nX_low,p%nY_low,1_IntKi/), (/p%X0_low,p%Y0_low,p%OutDisWindZ(k)/), (/p%dX_low,p%dY_low,p%dZ_low/), m%outVizXYPlane, ErrStat2, ErrMsg2 )
@@ -1562,7 +1556,7 @@ subroutine AWAE_CalcOutput( t, u, p, x, xd, z, OtherState, y, m, errStat, errMsg
          call ExtractSlice( YZSlice, p%OutDisWindX(k), p%X0_low, p%nX_low, p%nY_low, p%nZ_low, p%dX_low, m%Vdist_low_full, m%outVizYZPlane(:,:,:,1))
             ! Create the output vtk file with naming <WindFilePath>/Low/DisYZ<k>.t<n/p%WrDisSkp1>.vtk
          FileName = trim(p%OutFileVTKRoot)//".Low.DisYZ"//trim(num2lstr(k))//"."//trim(Tstr)//".vtk"
-         call WrVTK_SP_header( FileName, "Low resolution, disturbed wind of YZ Slice at time = "//trim(num2lstr(t))//" seconds.", Un, ErrStat2, ErrMsg2 )
+         call WrVTK_SP_header( FileName, "Low resolution, disturbed wind of YZ Slice at time = "//trim(num2lstr(t))//" s", Un, ErrStat2, ErrMsg2 )
             call SetErrStat(ErrStat2, ErrMsg2, ErrStat, ErrMsg, RoutineName)
             if (ErrStat >= AbortErrLev) return
          call WrVTK_SP_vectors3D( Un, "Velocity", (/1,p%nY_low,p%nZ_low/), (/p%OutDisWindX(k),p%Y0_low,p%Z0_low/), (/p%dX_low,p%dY_low,p%dZ_low/), m%outVizYZPlane, ErrStat2, ErrMsg2 )
@@ -1575,7 +1569,7 @@ subroutine AWAE_CalcOutput( t, u, p, x, xd, z, OtherState, y, m, errStat, errMsg
          call ExtractSlice( XZSlice, p%OutDisWindY(k), p%Y0_low, p%nY_low, p%nX_low, p%nZ_low, p%dY_low, m%Vdist_low_full, m%outVizXZPlane(:,:,:,1))
             ! Create the output vtk file with naming <WindFilePath>/Low/DisXZ<k>.t<n/p%WrDisSkp1>.vtk
          FileName = trim(p%OutFileVTKRoot)//".Low.DisXZ"//trim(num2lstr(k))//"."//trim(Tstr)//".vtk"
-         call WrVTK_SP_header( FileName, "Low resolution, disturbed wind of XZ Slice at time = "//trim(num2lstr(t))//" seconds.", Un, ErrStat2, ErrMsg2 )
+         call WrVTK_SP_header( FileName, "Low resolution, disturbed wind of XZ Slice at time = "//trim(num2lstr(t))//" s", Un, ErrStat2, ErrMsg2 )
             call SetErrStat(ErrStat2, ErrMsg2, ErrStat, ErrMsg, RoutineName)
             if (ErrStat >= AbortErrLev) return
          call WrVTK_SP_vectors3D( Un, "Velocity", (/p%nX_low,1,p%nZ_low/), (/p%X0_low,p%OutDisWindY(k),p%Z0_low/), (/p%dX_low,p%dY_low,p%dZ_low/), m%outVizXZPlane, ErrStat2, ErrMsg2 )

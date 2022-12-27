@@ -159,12 +159,16 @@ SUBROUTINE Farm_Initialize( farm, InputFile, ErrStat, ErrMsg )
    CHARACTER(*), PARAMETER                 :: RoutineName = 'Farm_Initialize'       
    CHARACTER(ChanLen)                      :: OutList(Farm_MaxOutPts) ! list of user-requested output channels
    INTEGER(IntKi)                          :: i
+   real(DbKi)                              :: tm1, tm2, t1, t2
    !..........
    ErrStat = ErrID_None
    ErrMsg  = ""         
    AbortErrLev  = ErrID_Fatal                                 ! Until we read otherwise from the FAST input file, we abort only on FATAL errors
       
    
+   tm1 =  omp_get_wtime() 
+   write(*,*)  ' Farm_Initialize: Starting..'
+
       ! ... Open and read input files, initialize global parameters. ...
       
    IF (LEN_TRIM(InputFile) == 0) THEN ! no input file was specified
@@ -190,7 +194,6 @@ SUBROUTINE Farm_Initialize( farm, InputFile, ErrStat, ErrMsg )
    !...............................................................................................................................  
    ! step 1: read input file
    !...............................................................................................................................  
-      
    call Farm_ReadPrimaryFile( InputFile, farm%p, WD_InitInput%InputFileData, AWAE_InitInput%InputFileData, SC_InitInp, OutList, ErrStat2, ErrMsg2 )
       CALL SetErrStat(ErrStat2, ErrMsg2, ErrStat, ErrMsg, RoutineName )
       IF (ErrStat >= AbortErrLev) THEN
@@ -237,6 +240,8 @@ SUBROUTINE Farm_Initialize( farm, InputFile, ErrStat, ErrMsg )
    
       !-------------------
       ! a. CALL AWAE_Init
+   t1 =  omp_get_wtime() 
+   write(*,*)  '   Farm_Initialize:AWAE_Init: Starting'
    
    AWAE_InitInput%InputFileData%dr           = WD_InitInput%InputFileData%dr
    AWAE_InitInput%InputFileData%dt_low       = farm%p%dt_low 
@@ -268,8 +273,13 @@ SUBROUTINE Farm_Initialize( farm, InputFile, ErrStat, ErrMsg )
    farm%p%dZ_low = AWAE_InitOutput%dZ_low
    farm%p%Module_Ver( ModuleFF_AWAE  ) = AWAE_InitOutput%Ver
    
+   t2 =  omp_get_wtime() 
+   write(*,*)  '   Farm_Initialize:AWAE_Init: Done. Time '//trim(num2lstr(t2-t1))//' s'
+
       !-------------------
       ! b. CALL SC_Init
+   t1 =  omp_get_wtime() 
+   write(*,*)  '   Farm_Initialize:SC_Init: Starting'
    if ( farm%p%useSC ) then
       SC_InitInp%nTurbines = farm%p%NumTurbines
       call SC_Init(SC_InitInp, farm%SC%uInputs, farm%SC%p, farm%SC%x, farm%SC%xd, farm%SC%z, farm%SC%OtherState, &
@@ -297,33 +307,47 @@ SUBROUTINE Farm_Initialize( farm, InputFile, ErrStat, ErrMsg )
       allocate(farm%SC%y%fromSCglob(0))
       allocate(farm%SC%y%fromSC(0))
    end if
+
+   t2 =  omp_get_wtime() 
+   write(*,*)  '   Farm_Initialize:SC_Init: Done. Time '//trim(num2lstr(t2-t1))//' s'
    
       !-------------------
       ! c. initialize WD (one instance per turbine, each can be done in parallel, too)
-      
+   t1 =  omp_get_wtime() 
+   write(*,*)  '   Farm_Initialize:InitWD: Starting'
+
    call Farm_InitWD( farm, WD_InitInput, ErrStat2, ErrMsg2 )
       CALL SetErrStat(ErrStat2, ErrMsg2, ErrStat, ErrMsg, RoutineName )
       IF (ErrStat >= AbortErrLev) THEN
          CALL Cleanup()
          RETURN
       END IF   
+
+   t2 =  omp_get_wtime() 
+   write(*,*)  '   Farm_Initialize:InitWD: Done. Time '//trim(num2lstr(t2-t1))//' s'
       
       
    !...............................................................................................................................  
    ! step 4: initialize FAST (each instance of FAST can also be done in parallel)
    !...............................................................................................................................  
 
+   t1 =  omp_get_wtime() 
+   write(*,*)  '   Farm_Initialize:InitFAST: Starting'
    CALL Farm_InitFAST( farm, WD_InitInput%InputFileData, AWAE_InitOutput, SC_InitOut, farm%SC%y, ErrStat2, ErrMsg2)
      CALL SetErrStat(ErrStat2, ErrMsg2, ErrStat, ErrMsg, RoutineName )
       IF (ErrStat >= AbortErrLev) THEN
          CALL Cleanup()
          RETURN
       END IF   
+   t2 =  omp_get_wtime() 
+   write(*,*)  '   Farm_Initialize:InitFAST: Done. Time '//trim(num2lstr(t2-t1))//' s'
       
    !...............................................................................................................................  
    ! step 4.5: initialize farm-level MoorDyn if applicable
    !...............................................................................................................................  
    
+   t1 =  omp_get_wtime() 
+   write(*,*)  '   Farm_Initialize:InitMD: Starting'
    if (farm%p%MooringMod == 3) then
       CALL Farm_InitMD( farm, ErrStat2, ErrMsg2)  ! FAST instances must be initialized first so that turbine initial positions are known
         CALL SetErrStat(ErrStat2, ErrMsg2, ErrStat, ErrMsg, RoutineName )
@@ -332,6 +356,8 @@ SUBROUTINE Farm_Initialize( farm, InputFile, ErrStat, ErrMsg )
             RETURN
          END IF   
    end if
+   t2 =  omp_get_wtime() 
+   write(*,*)  '   Farm_Initialize:InitMD: Done. Time '//trim(num2lstr(t2-t1))//' s'
 
    !...............................................................................................................................  
    ! step 5: Open output file (or set up output file handling)      
@@ -363,6 +389,9 @@ SUBROUTINE Farm_Initialize( farm, InputFile, ErrStat, ErrMsg )
    !...............................................................................................................................      
    CALL Cleanup()
    
+   tm2 =  omp_get_wtime() 
+   write(*,*)  '  Farm_Initialize: Done. Time '//trim(num2lstr(tm2-tm1))//' s'
+
 CONTAINS
    SUBROUTINE Cleanup()
    
@@ -1581,10 +1610,16 @@ SUBROUTINE Farm_InitWD( farm, WD_InitInp, ErrStat, ErrMsg )
    INTEGER(IntKi)                          :: ErrStat2                        ! Temporary Error status
    CHARACTER(ErrMsgLen)                    :: ErrMsg2                         ! Temporary Error message
    CHARACTER(*),   PARAMETER               :: RoutineName = 'Farm_InitWD'
+   real(DbKi)                              :: t1, t2
          
    ErrStat = ErrID_None
    ErrMsg = ""
    
+!#ifdef _OPENMP
+!   t1 = omp_get_wtime()  
+!   write(*,*)  'Farm_InitWD: Starting'
+!#endif 
+
    ALLOCATE(farm%WD(farm%p%NumTurbines),STAT=ErrStat2)
    if (ErrStat2 /= 0) then
       CALL SetErrStat( ErrID_Fatal, 'Could not allocate memory for Wake Dynamics data', ErrStat, ErrMsg, RoutineName )
@@ -1620,10 +1655,16 @@ SUBROUTINE Farm_InitWD( farm, WD_InitInp, ErrStat, ErrMsg )
       
       call cleanup()
       
+!#ifdef _OPENMP
+!   t2 = omp_get_wtime()  
+!   write(*,*)  'Farm_InitWD: Done. Par Time: '//trim(num2lstr(t2-t1))//' s'
+!#endif 
+
 contains
    subroutine cleanup()
       call WD_DestroyInitOutput( WD_InitOut, ErrStat2, ErrMsg2 )
    end subroutine cleanup
+
 END SUBROUTINE Farm_InitWD
 !----------------------------------------------------------------------------------------------------------------------------------
 !> This routine initializes all instances of FAST using the FASTWrapper module
@@ -1648,7 +1689,12 @@ SUBROUTINE Farm_InitFAST( farm, WD_InitInp, AWAE_InitOutput, SC_InitOutput, SC_y
    INTEGER(IntKi)                          :: ErrStat2                        ! Temporary Error status
    CHARACTER(ErrMsgLen)                    :: ErrMsg2                         ! Temporary Error message
    CHARACTER(*),   PARAMETER               :: RoutineName = 'Farm_InitFAST'
+   real(DbKi)                              :: t1, t2
    
+!#ifdef _OPENMP
+!   t1 = omp_get_wtime()  
+!   write(*,*)  'Farm_InitFAST: Starting'
+!#endif 
    
    ErrStat = ErrID_None
    ErrMsg = ""
@@ -1744,11 +1790,17 @@ SUBROUTINE Farm_InitFAST( farm, WD_InitInp, AWAE_InitOutput, SC_InitOutput, SC_y
       
       call cleanup()
       
+!#ifdef _OPENMP
+!   t2 = omp_get_wtime()  
+!   write(*,*)  'Farm_InitFAST: Done. Par Time: '//trim(num2lstr(t2-t1))//' s'
+!#endif 
+
 contains
    subroutine cleanup()
       call FWrap_DestroyInitInput( FWrap_InitInp, ErrStat2, ErrMsg2 )
       call FWrap_DestroyInitOutput( FWrap_InitOut, ErrStat2, ErrMsg2 )
    end subroutine cleanup
+
 END SUBROUTINE Farm_InitFAST
 !----------------------------------------------------------------------------------------------------------------------------------
 !> This routine initializes a farm-level instance of MoorDyn if applicable
@@ -2034,12 +2086,17 @@ subroutine FARM_InitialCO(farm, ErrStat, ErrMsg)
    INTEGER(IntKi)                          :: ErrStat2                        ! Temporary Error status
    CHARACTER(ErrMsgLen)                    :: ErrMsg2                         ! Temporary Error message
    CHARACTER(*),   PARAMETER               :: RoutineName = 'FARM_InitialCO'
+   real(DbKi)                              :: t1, t2, tm1, tm2
    
    
    ErrStat = ErrID_None
    ErrMsg = ""
    
    
+#ifdef _OPENMP
+   tm1 = omp_get_wtime()  
+   write(*,*)  'Farm_InitialCO: Starting'
+#endif 
 
    
    !.......................................................................................
@@ -2048,6 +2105,9 @@ subroutine FARM_InitialCO(farm, ErrStat, ErrMsg)
    
       !--------------------
       ! 1a. u_AWAE=0         
+   t1 =  omp_get_wtime() 
+   write(*,*)  '   Farm_initialCO:AWAE_CO_1: Starting'
+
    farm%AWAE%u%xhat_plane = 0.0_ReKi     ! Orientations of wake planes, normal to wake planes, for each turbine
    farm%AWAE%u%p_plane    = 0.0_ReKi     ! Center positions of wake planes for each turbine
    farm%AWAE%u%Vx_wake    = 0.0_ReKi     ! Axial wake velocity deficit at wake planes, distributed radially, for each turbine
@@ -2067,9 +2127,15 @@ subroutine FARM_InitialCO(farm, ErrStat, ErrMsg)
    call Transfer_AWAE_to_FAST(farm)      
    call Transfer_AWAE_to_WD(farm)   
 
+   t2 =  omp_get_wtime() 
+   write(*,*)  '   Farm_initialCO:AWAE_CO_1: Done. Par Time '//trim(num2lstr(t2-t1))//' s'
+
    if (farm%p%UseSC) then
       !--------------------
       ! 2a. u_SC=0         
+       t1 =  omp_get_wtime() 
+       write(*,*)  '   Farm_initialCO:SC_CO: Starting'
+
       if ( farm%SC%p%NInpGlobal > 0 ) farm%SC%uInputs%toSCglob = 0.0_SiKi
       if ( farm%SC%p%NumCtrl2SC > 0 ) farm%SC%uInputs%toSC     = 0.0_SiKi
       
@@ -2080,7 +2146,7 @@ subroutine FARM_InitialCO(farm, ErrStat, ErrMsg)
                            farm%SC%OtherState, farm%SC%y, farm%SC%m, ErrStat, ErrMsg )         
             call SetErrStat(ErrStat2, ErrMsg2, ErrStat, ErrMsg, RoutineName)
             if (ErrStat >= AbortErrLev) return
-         
+
       !--------------------
       ! 2c. transfer y_SC to u_F         
    
@@ -2089,6 +2155,9 @@ subroutine FARM_InitialCO(farm, ErrStat, ErrMsg)
             ! SC stores all turbine-controller data in a 1D array, need to separate these out for each turbine
          farm%FWrap(nt)%u%fromSC(:) = farm%SC%y%fromSC( (nt-1)*farm%SC%p%NumSC2Ctrl+1:nt*farm%SC%p%NumSC2Ctrl ) 
       end do
+
+       t2 =  omp_get_wtime() 
+       write(*,*)  '   Farm_initialCO:SC_CO: Done. Time '//trim(num2lstr(t2-t1))//' s'
       
    end if ! (farm%p%UseSC)
    
@@ -2096,6 +2165,9 @@ subroutine FARM_InitialCO(farm, ErrStat, ErrMsg)
    ! CALL F_t0 (can be done in parallel)
    !.......................................................................................
          
+   t1 =  omp_get_wtime() 
+   write(*,*)  '   Farm_initialCO:FWrap_t0: Starting'
+
    DO nt = 1,farm%p%NumTurbines
       
       call FWrap_t0( farm%FWrap(nt)%u, farm%FWrap(nt)%p, farm%FWrap(nt)%x, farm%FWrap(nt)%xd, farm%FWrap(nt)%z, &
@@ -2104,6 +2176,9 @@ subroutine FARM_InitialCO(farm, ErrStat, ErrMsg)
                
    END DO
    if (ErrStat >= AbortErrLev) return
+
+   t2 =  omp_get_wtime() 
+   write(*,*)  '   Farm_initialCO:FWrap_t0: Done. Time '//trim(num2lstr(t2-t1))//' s'
    
    !.......................................................................................
    ! Transfer y_F to u_SC and u_WD (can be done in parallel)
@@ -2128,6 +2203,8 @@ subroutine FARM_InitialCO(farm, ErrStat, ErrMsg)
    !.......................................................................................
    ! CALL WD_CO (can be done in parallel)
    !.......................................................................................
+   t1 =  omp_get_wtime() 
+   write(*,*)  '   Farm_initialCO:WD_CO: Starting'
    
    DO nt = 1,farm%p%NumTurbines
       
@@ -2137,6 +2214,9 @@ subroutine FARM_InitialCO(farm, ErrStat, ErrMsg)
                
    END DO
    if (ErrStat >= AbortErrLev) return
+
+   t2 =  omp_get_wtime() 
+   write(*,*)  '   Farm_initialCO:WD_CO: Done. Time '//trim(num2lstr(t2-t1))//' s'
    
    !.......................................................................................
    ! Transfer y_WD to u_AWAE
@@ -2147,11 +2227,16 @@ subroutine FARM_InitialCO(farm, ErrStat, ErrMsg)
    !.......................................................................................
    ! CALL AWAE_CO
    !.......................................................................................
+   t1 =  omp_get_wtime() 
+   write(*,*)  '   Farm_initialCO:AWAE_CO_2: Starting'
    
    call AWAE_CalcOutput( 0.0_DbKi, farm%AWAE%u, farm%AWAE%p, farm%AWAE%x, farm%AWAE%xd, farm%AWAE%z, &
                      farm%AWAE%OtherSt, farm%AWAE%y, farm%AWAE%m, ErrStat2, ErrMsg2 )         
          call SetErrStat(ErrStat2, ErrMsg2, ErrStat, ErrMsg, RoutineName)
    if (ErrStat >= AbortErrLev) return
+
+   t2 =  omp_get_wtime() 
+   write(*,*)  '   Farm_initialCO:AWAE_CO_2: Done. Par Time '//trim(num2lstr(t2-t1))//' s'
    
    !.......................................................................................
    ! Transfer y_AWAE to u_F and u_WD
@@ -2167,6 +2252,11 @@ subroutine FARM_InitialCO(farm, ErrStat, ErrMsg)
    call Farm_WriteOutput(0, 0.0_DbKi, farm, ErrStat2, ErrMsg2)
       call SetErrStat(ErrStat2, ErrMsg2, ErrStat, ErrMsg, RoutineName)
    
+#ifdef _OPENMP
+   tm2 = omp_get_wtime()  
+   write(*,*)  'Farm_InitialCO: Done. Par Time: '//trim(num2lstr(tm2-tm1))//' s'
+#endif 
+
 end subroutine FARM_InitialCO
 !---------------------------------------------------------------------------------------------------------------------------------- 
 !> This routine updates states each time increment. 
@@ -2196,7 +2286,7 @@ subroutine FARM_UpdateStates(t, n, farm, ErrStat, ErrMsg)
    INTEGER(IntKi), ALLOCATABLE             :: ErrStatF(:)                     ! Temporary Error status for FAST
    CHARACTER(ErrMsgLen), ALLOCATABLE       :: ErrMsgF (:)                     ! Temporary Error message for FAST
    CHARACTER(*),   PARAMETER               :: RoutineName = 'FARM_UpdateStates'
-   REAL(DbKi)                              :: tm1,tm2,tm3,tm4,tm5, tm01, tm02, tm03, tmSF, tmSM  ! timer variables
+   REAL(DbKi)                              :: ti,tf,tt1,tt2,tm1,tm2,tm3,tm4,tm5, tm01, tm02, tm03, tmSF, tmSM  ! timer variables
    
    ErrStat = ErrID_None
    ErrMsg = ""
@@ -2208,6 +2298,10 @@ subroutine FARM_UpdateStates(t, n, farm, ErrStat, ErrMsg)
    if (ErrStat >= AbortErrLev) return
    
    
+#ifdef _OPENMP
+   ti = omp_get_wtime()  
+   write(*,*)  'Farm_US: Starting'
+#endif 
 
    
    
@@ -2220,8 +2314,8 @@ subroutine FARM_UpdateStates(t, n, farm, ErrStat, ErrMsg)
   
 
 #ifdef _OPENMP
-    tm1 = omp_get_wtime()
-    write(*,*) 'WD_UpdateStates: Starting parallel loop.'
+    tt1 = omp_get_wtime()
+    write(*,*) '   Farm_US:WD_US: Starting'
 #endif
    !$OMP PARALLEL default(shared)
    !$OMP do private(nt, ErrStat2, ErrMsg2) schedule(runtime)
@@ -2243,8 +2337,8 @@ subroutine FARM_UpdateStates(t, n, farm, ErrStat, ErrMsg)
    !$OMP END PARALLEL
    
 #ifdef _OPENMP
-    tm2 = omp_get_wtime()
-    write(*,*) 'WD_UpdateStates: Done. Took '//trim(num2lstr(tm2-tm1))//' s.'
+    tt2 = omp_get_wtime()
+    write(*,*) '  Farm_US:WD_US: Done. Par Time '//trim(num2lstr(tt2-tt1))//' s.'
 #endif
 
    if (ErrStat >= AbortErrLev) return
@@ -2252,54 +2346,57 @@ subroutine FARM_UpdateStates(t, n, farm, ErrStat, ErrMsg)
    
       !--------------------
       ! 2. CALL SC_US  
+    tt1 = omp_get_wtime()
+    write(*,*) '   Farm_US:SC_US: Starting'
+
    if (farm%p%useSC) then
       farm%SC%utimes(1) = t
       call SC_UpdateStates(t, n, farm%SC%uInputs,farm%SC%utimes, farm%SC%p, farm%SC%x, farm%SC%xd, farm%SC%z, farm%SC%OtherState, farm%SC%m, errStat, errMsg ) ! implement framework interface arguments
       if (errStat >= AbortErrLev) return
    end if
    
+    tt2 = omp_get_wtime()
+    write(*,*) '  Farm_US:SC_US: Done. Time '//trim(num2lstr(tt2-tt1))//' s.'
    
       !--------------------
       ! 3. CALL F_Increment (and FARM_MD_Increment) and 4. CALL AWAE_UpdateStates  
       
       
-#ifdef _OPENMP
-    tm1 = omp_get_wtime()
-    write(*,*) 'FWrap_SetInputs: Starting serial loop.'
-#endif
    ! set the inputs needed for FAST (these are slow-varying so can just be done once per farm time step)
    do nt = 1,farm%p%NumTurbines
       call FWrap_SetInputs(farm%FWrap(nt)%u, farm%FWrap(nt)%m, t)
    end do
-#ifdef _OPENMP
-    tm2 = omp_get_wtime()
-    write(*,*) 'FWrap_SetInputs: Done. Took '//trim(num2lstr(tm2-tm1))//' s.'
-#endif
    
    
 #ifdef _OPENMP
-      tm1 = omp_get_wtime()  
+      tt1 = omp_get_wtime()  
       tmSF = 0.0_DbKi 
       tmSM = 0.0_DbKi 
-      write(*,*) 'FAST and Moordyn for FF_UpdateStates. Starting loop.'
+      write(*,*) '  Farm_US:FWrap_increment: Starting'
 #endif     
    ! Original case: no shared moorings 
    if (farm%p%MooringMod == 0) then     
 
-#ifdef _OPENMP
-          tm3 = omp_get_wtime()  
-#endif
       !$OMP PARALLEL DO DEFAULT(Shared) Private(nt)
       DO nt = 1,farm%p%NumTurbines
+         !#ifdef _OPENMP
+           tm3 = omp_get_wtime()  
+         !#endif
          call FWrap_Increment( t, n, farm%FWrap(nt)%u, farm%FWrap(nt)%p, farm%FWrap(nt)%x, farm%FWrap(nt)%xd, farm%FWrap(nt)%z, &
                      farm%FWrap(nt)%OtherSt, farm%FWrap(nt)%y, farm%FWrap(nt)%m, ErrStatF(nt), ErrMsgF(nt) )         
+         !#ifdef _OPENMP
+           tm2 = omp_get_wtime()  
+           write(*,*)  '  FWrap_Increment w/o MoorDyn for turb #'//trim(num2lstr(nt))//' on thread #'//trim(num2lstr(omp_get_thread_num()))//' took '//trim(num2lstr(tm2-tm3))//' s'
+         !#endif  
       END DO
       !$OMP END PARALLEL DO  
-#ifdef _OPENMP
-          tm2 = omp_get_wtime()  
-          write(*,*)  '    FWrap_Increment w/o MoorDyn for turbine #'//trim(num2lstr(nt))//' using thread #'//trim(num2lstr(omp_get_thread_num()))//' took '//trim(num2lstr(tm2-tm3))//' seconds'
-#endif  
    
+
+    #ifdef _OPENMP   
+         tt2 = omp_get_wtime()
+         write(*,*) ' Farm_US:FWrap_Increment w/o MD: Done. Par Time '//trim(num2lstr(tt2-tt1))//' s'
+    #endif 
+
    ! Farm-level moorings case using MoorDyn
    else if (farm%p%MooringMod == 3) then
       
@@ -2330,8 +2427,19 @@ subroutine FARM_UpdateStates(t, n, farm, ErrStat, ErrMsg)
 !             write(*,*)  '    FWrap_Increment with MoorDyn for turbine #'//trim(num2lstr(nt))//' using thread #'//trim(num2lstr(omp_get_thread_num()))//' took '//trim(num2lstr(tm2-tm3))//' seconds'
 !#endif  
       
+    #ifdef _OPENMP   
+         tt2 = omp_get_wtime()
+         write(*,*) ' Farm_US:FWrap_Increment w/ MD: Done. Par Time '//trim(num2lstr(tt2-tt1))//' s'
+    #endif 
+
+
          ! call farm-level MoorDyn time step here (can't multithread this with FAST since it needs inputs from all FAST instances)
+         tt1 = omp_get_wtime()
+         write(*,*) '   Farm_US:MD_Increment: Starting'
          call Farm_MD_Increment( t2, n_FMD, farm, ErrStatMD, ErrMsgMD)
+         tt2 = omp_get_wtime()
+         write(*,*) ' Farm_US:MD_Increment: Done. Time '//trim(num2lstr(tt2-tt1))//' s'
+
          call SetErrStat(ErrStatMD, ErrMsgMD, ErrStat, ErrMsg, 'FARM_UpdateStates')  ! MD error status <<<<<
          
          !#ifdef printthreads
@@ -2351,19 +2459,24 @@ subroutine FARM_UpdateStates(t, n, farm, ErrStat, ErrMsg)
    else
       CALL SetErrStat( ErrID_Fatal, 'MooringMod must be 0 or 3.', ErrStat, ErrMsg, RoutineName )
    end if
-#ifdef _OPENMP   
-     tm4 = omp_get_wtime()
-     write(*,*) 'FAST and Moordyn for FF_UpdateStates. Done. Took '//trim(num2lstr(tm4-tm1))//' seconds.'
-#endif 
+
+
+
+
+#ifdef _OPENMP
+    tt1 = omp_get_wtime()
+    write(*,*) '  Farm_US:AWAE_US: Starting'
+#endif
 
    call AWAE_UpdateStates( t, n, farm%AWAE%u, farm%AWAE%p, farm%AWAE%x, farm%AWAE%xd, farm%AWAE%z, &
                      farm%AWAE%OtherSt, farm%AWAE%m, ErrStatAWAE, ErrMsgAWAE )       
 
 #ifdef _OPENMP   
-     tm5 = omp_get_wtime()
-     write(*,*) 'AWAE_UpdateStates. Done. Took '//trim(num2lstr(tm5-tm2))//' seconds.'
-     write(*,*) 'Total Farm_US took '//trim(num2lstr(tm5-tm1))//' seconds.'
+     tt2 = omp_get_wtime()
+     write(*,*) 'Farm_US:AWAE_US. Done. Time '//trim(num2lstr(tt2-tt1))//' s'
 #endif 
+
+
    
    ! update error messages from FAST's and AWAE's time steps
    DO nt = 1,farm%p%NumTurbines 
@@ -2373,14 +2486,22 @@ subroutine FARM_UpdateStates(t, n, farm, ErrStat, ErrMsg)
    call SetErrStat(ErrStatAWAE, ErrMsgAWAE, ErrStat, ErrMsg, 'FARM_UpdateStates')  ! AWAE error status
    
    ! calculate outputs from FAST as needed by FAST.Farm
+   tt1 = omp_get_wtime()
+   write(*,*) '  Farm_US:FWrap_CO: Starting'
    do nt = 1,farm%p%NumTurbines
       call FWrap_CalcOutput(farm%FWrap(nt)%p, farm%FWrap(nt)%u, farm%FWrap(nt)%y, farm%FWrap(nt)%m, ErrStat2, ErrMsg2)  
          call setErrStat(ErrStat2,ErrMsg2,ErrStat,ErrMsg,RoutineName)
    end do
+   tt2 = omp_get_wtime()
+   write(*,*) 'Farm_US:FWrap_CO. Done. Time '//trim(num2lstr(tt2-tt1))//' s'
 
    
    if (ErrStat >= AbortErrLev) return
 
+#ifdef _OPENMP
+   tf = omp_get_wtime()  
+   write(*,*)  'Farm_US: Done. Par Time: '//trim(num2lstr(tf-ti))//' s'
+#endif 
    
 end subroutine FARM_UpdateStates
 !---------------------------------------------------------------------------------------------------------------------------------- 
@@ -2398,11 +2519,16 @@ subroutine Farm_WriteOutput(n, t, farm, ErrStat, ErrMsg)
    REAL(ReKi)                              :: vel(3), pt(3)
    REAL(ReKi)                              :: vec_interp(3)
    REAL(ReKi)                              :: norm2_vec, delta, deltad
+   real(DbKi)                              :: t1, t2
    
    
    ErrStat = ErrID_None
    ErrMsg = ""
    
+   t1 = omp_get_wtime()  
+   write(*,*)  '  Farm_WriteOutput: Starting'
+
+
       ! If requested write output channel data
    if ( farm%p%NumOuts > 0 ) then
     
@@ -2670,6 +2796,11 @@ subroutine Farm_WriteOutput(n, t, farm, ErrStat, ErrMsg)
          call SetErrStat(ErrStat2, ErrMsg2, ErrStat, ErrMsg, RoutineName)
          
    end if
+
+
+   t2 = omp_get_wtime()  
+   write(*,*)  '  Farm_WriteOutput: Done. Serial Time: '//trim(num2lstr(t2-t1))//' s'
+
 end subroutine Farm_WriteOutput
 !---------------------------------------------------------------------------------------------------------------------------------- 
 !> This routine calculates outputs at each time increment and solves for the inputs at the next step. 
@@ -2692,12 +2823,13 @@ subroutine FARM_CalcOutput(t, farm, ErrStat, ErrMsg)
    CHARACTER(ErrMsgLen)                    :: ErrMsg2                         ! Temporary Error message
    CHARACTER(*),   PARAMETER               :: RoutineName = 'FARM_CalcOutput'
    INTEGER(IntKi)                          :: n                               ! time step increment number
-!   REAL(DbKi)                              :: tm1
+   REAL(DbKi)                              :: tm1, tm2, t1, t2
    ErrStat = ErrID_None
    ErrMsg = ""
-   
-  ! tm1 = omp_get_wtime()
-   
+  
+   tm1 = omp_get_wtime()
+   write(*,*)  'Farm_CalcOutput: Starting'
+
    !.......................................................................................
    ! calculate module outputs and perform some input-output solves (steps 1. and 2. and 3. can be done in parallel,
    !  but be careful that step 3 doesn't modify the inputs to steps 1 or 2)
@@ -2705,6 +2837,8 @@ subroutine FARM_CalcOutput(t, farm, ErrStat, ErrMsg)
    
       !--------------------
       ! 1. call WD_CO and transfer y_WD to u_AWAE        
+   t1 = omp_get_wtime()
+   write(*,*)  'Farm_CO:WD_CO: Starting'
    
    !$OMP PARALLEL DO DEFAULT (shared) PRIVATE(nt, ErrStat2, ErrMsg2) schedule(runtime)
    DO nt = 1,farm%p%NumTurbines
@@ -2719,9 +2853,18 @@ subroutine FARM_CalcOutput(t, farm, ErrStat, ErrMsg)
    END DO
    !$OMP END PARALLEL DO  
    if (ErrStat >= AbortErrLev) return
+   t2 = omp_get_wtime()  
+   write(*,*)  'Farm_CO:WD_CO Done. Par Time: '//trim(num2lstr(t2-t1))//' s'
 
+   t1 = omp_get_wtime()
+   write(*,*)  'Farm_CO:TransferWD_AWAE: Starting'
    call Transfer_WD_to_AWAE(farm)
+   t2 = omp_get_wtime()  
+   write(*,*)  'Farm_CO:TransferWD_AWAE Done. Par Time: '//trim(num2lstr(t2-t1))//' s'
    
+
+   t1 = omp_get_wtime()
+   write(*,*)  'Farm_CO:SC: Starting'
    if ( farm%p%UseSC ) then
 
          !--------------------
@@ -2745,11 +2888,17 @@ subroutine FARM_CalcOutput(t, farm, ErrStat, ErrMsg)
       end do
       
    end if
+   t2 = omp_get_wtime()  
+   write(*,*)  'Farm_CO:SC Done. Par Time: '//trim(num2lstr(t2-t1))//' s'
    
       !--------------------
       ! 3b. Transfer y_F to u_WD         
          
+   t1 = omp_get_wtime()
+   write(*,*)  'Farm_CO:TransferFAST_WD: Starting'
    call Transfer_FAST_to_WD(farm)
+   t2 = omp_get_wtime()  
+   write(*,*)  'Farm_CO:TransferFAST_WD Done. Par Time: '//trim(num2lstr(t2-t1))//' s'
          
    !.......................................................................................
    ! calculate AWAE outputs and perform rest of input-output solves
@@ -2757,25 +2906,44 @@ subroutine FARM_CalcOutput(t, farm, ErrStat, ErrMsg)
    
       !--------------------
       ! 1. call AWAE_CO 
+   t1 = omp_get_wtime()
+   write(*,*)  'Farm_CO:AWAE_CO: Starting'
    call AWAE_CalcOutput( t, farm%AWAE%u, farm%AWAE%p, farm%AWAE%x, farm%AWAE%xd, farm%AWAE%z, &
                      farm%AWAE%OtherSt, farm%AWAE%y, farm%AWAE%m, ErrStat2, ErrMsg2 )         
          call SetErrStat(ErrStat2, ErrMsg2, ErrStat, ErrMsg, RoutineName)
+   t2 = omp_get_wtime()  
+   write(*,*)  'Farm_CO:AWAE_CO Done. Par Time: '//trim(num2lstr(t2-t1))//' s'
 
       !--------------------
       ! 2. Transfer y_AWAE to u_F  and u_WD   
+   t1 = omp_get_wtime()
+   write(*,*)  'Farm_CO:TransferAWAE_FAST: Starting'
    call Transfer_AWAE_to_FAST(farm)      
+   t2 = omp_get_wtime()  
+   write(*,*)  'Farm_CO:TransferAWAE_FAST Done. Par Time: '//trim(num2lstr(t2-t1))//' s'
+
+   t1 = omp_get_wtime()
+   write(*,*)  'Farm_CO:TransferAWAE_WD: Starting'
    call Transfer_AWAE_to_WD(farm)   
+   t2 = omp_get_wtime()  
+   write(*,*)  'Farm_CO:TransferAWAE_WD Done. Par Time: '//trim(num2lstr(t2-t1))//' s'
    
    
    !.......................................................................................
    ! Write Output to File
    !.......................................................................................
       ! NOTE: Visualization data is output via the AWAE module
+   t1 = omp_get_wtime()
+   write(*,*)  'Farm_CO:WriteOutpus: Starting'
    n = nint(t/farm%p%DT_low)
    call Farm_WriteOutput(n, t, farm, ErrStat2, ErrMsg2)
       call SetErrStat(ErrStat2, ErrMsg2, ErrStat, ErrMsg, RoutineName)
+   t2 = omp_get_wtime()  
+   write(*,*)  'Farm_CO:WriteOutputs Done. Par Time: '//trim(num2lstr(t2-t1))//' s'
    
- !  write(*,*) 'Total Farm_CO-serial took '//trim(num2lstr(omp_get_wtime()-tm1))//' seconds.' 
+ !  write(*,*) 'Total Farm_CO-serial took '//trim(num2lstr(omp_get_wtime()-tm1))//' s' 
+   tm2 = omp_get_wtime()  
+   write(*,*)  'Farm_CalcOutput: Done. Serial Time: '//trim(num2lstr(tm2-tm1))//' s'
    
 end subroutine FARM_CalcOutput
 !----------------------------------------------------------------------------------------------------------------------------------
@@ -2795,8 +2963,11 @@ subroutine FARM_End(farm, ErrStat, ErrMsg)
    INTEGER(IntKi)                          :: ErrStat2                        ! Temporary Error status
    CHARACTER(ErrMsgLen)                    :: ErrMsg2                         ! Temporary Error message
    CHARACTER(*),   PARAMETER               :: RoutineName = 'FARM_End'
+   REAL(DbKi)                              :: t1, t2
    
    
+   t1 = omp_get_wtime()  
+   write(*,*)  'Farm_End: Starting'
    
    ErrStat = ErrID_None
    ErrMsg = ""
@@ -2875,6 +3046,9 @@ subroutine FARM_End(farm, ErrStat, ErrMsg)
    !.......................................................................................
    call Farm_DestroyAll_FastFarm_Data( farm, ErrStat2, ErrMsg2 )
       call SetErrStat(ErrStat2, ErrMsg2, ErrStat, ErrMsg, RoutineName)
+
+   t2 = omp_get_wtime()  
+   write(*,*)  'Farm_End: Done. Time: '//trim(num2lstr(t2-t1))//' s'
    
 end subroutine FARM_End
 !----------------------------------------------------------------------------------------------------------------------------------

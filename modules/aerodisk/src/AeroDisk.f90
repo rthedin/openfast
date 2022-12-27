@@ -198,6 +198,7 @@ contains
       character(*),     intent(  out)  :: ErrMsg3
       ErrStat3 = ErrID_None
       ErrMsg3  = ""
+      x%DummyContState           = 0.0_ReKi
       xd%DummyDiscreteState      = 0.0_ReKi
       z%DummyConstrState         = 0.0_ReKi
       OtherState%DummyOtherState = 0_IntKi
@@ -217,8 +218,8 @@ contains
       integer(IntKi),   intent(  out)  :: ErrStat3
       character(*),     intent(  out)  :: ErrMsg3
       integer(IntKi)                   :: i
-      call AllocAry(InitOut%WriteOutputHdr,p%NumOuts,'WriteOutputHdr',ErrStat2,ErrMsg2); if (Failed()) return;
-      call AllocAry(InitOut%WriteOutputUnt,p%NumOuts,'WriteOutputUnt',ErrStat2,ErrMsg2); if (Failed()) return;
+      call AllocAry(InitOut%WriteOutputHdr,p%NumOuts,'WriteOutputHdr',Errstat3,ErrMsg3);  if (ErrStat3 >= AbortErrLev) return
+      call AllocAry(InitOut%WriteOutputUnt,p%NumOuts,'WriteOutputUnt',Errstat3,ErrMsg3);  if (ErrStat3 >= AbortErrLev) return
       do i=1,p%NumOuts
          InitOut%WriteOutputHdr(i) = p%OutParam(i)%Name
          InitOut%WriteOutputUnt(i) = p%OutParam(i)%Units
@@ -430,6 +431,15 @@ SUBROUTINE ADsk_CalcOutput( t, u, p, x, xd, z, OtherState, y, m, ErrStat, ErrMsg
    call ADskTableInterp(p%AeroTable, p%UseTSR, m%lambda, real(u%RotSpeed,SiKi), m%VRel_xd, real(u%BlPitch,SiKi), m%Chi, m%idx_last, m%C_F, m%C_M, ErrStat2, ErrMsg2)
       if (Failed()) return
 
+   !> Apply skew if not in table
+   !! - \f$ \vec{F} = \vec{F} \left( \cos(\chi) \right)^2 \f$
+   !! - \f$ \vec{M} = \vec{M} \left( \cos(\chi) \right)^2 \f$
+   if (p%AeroTable%N_Skew  <= 0_IntKi) then
+      tmp1  = cos(m%Chi) * cos(m%Chi)
+      m%C_F(1:3)  = m%C_F(1:3) * tmp1
+      m%C_M(1:3)  = m%C_M(1:3) * tmp1
+   endif
+
    !-------------------------------------------
    !> Calculate forces using force coefficients (disk coordinates)
    !! - \f$ F_x = \frac{1}{2} \rho A \left( V_\textrm{rel,x} \right)^2 * C_\textrm{F,x}\left(\text{TSR}@\lambda,\text{RtSpd}@\Omega,\text{V}_\text{rel}@V_\textrm{rel},\text{Pitch}@\theta,\text{Skew}@\chi\right) \f$
@@ -442,14 +452,6 @@ SUBROUTINE ADsk_CalcOutput( t, u, p, x, xd, z, OtherState, y, m, ErrStat, ErrMsg
    m%Force(1:3)  = tmp1 * m%C_F(1:3)
    m%Moment(1:3) = tmp1 * real(p%RotorRad,SiKi) * m%C_M(1:3)
 
-   !> Apply skew if not in table
-   !! - \f$ \vec{F} = \vec{F} \left( \cos(\chi) \right)^2 \f$
-   !! - \f$ \vec{M} = \vec{M} \left( \cos(\chi) \right)^2 \f$
-   if (p%AeroTable%N_Skew  <= 0_IntKi) then
-      tmp1  = cos(m%Chi) * cos(m%Chi)
-      m%Force  = m%Force  * tmp1
-      m%Moment = m%Moment * tmp1
-   endif
 
 
    !-------------
@@ -458,8 +460,8 @@ SUBROUTINE ADsk_CalcOutput( t, u, p, x, xd, z, OtherState, y, m, ErrStat, ErrMsg
    !! - Torque coefficient: \f$ C_t = C_\textrm{M,x} \f$
    !! - \f$ \vec{F} = F_\textrm{x,disk} \hat{x} + F_\textrm{y,disk} \hat{y} + F_\textrm{z,disk} \hat{z} \f$ 
    !! - \f$ \vec{M} = M_\textrm{x,disk} \hat{x} + M_\textrm{y,disk} \hat{y} + M_\textrm{z,disk} \hat{z} \f$ 
-   y%Ct = m%Force(1)    ! Fx in disk reference frame
-   y%Cq = m%Moment(1)   ! Mx in disk reference frame
+   y%Ct = m%C_F(1)    ! Fx in disk reference frame
+   y%Cq = m%C_M(1)    ! Mx in disk reference frame
 
    ! AeroLoads in global coordinates
    y%AeroLoads%Force( 1:3,1) = m%Force( 1)*m%x_hat + m%Force( 2)*m%y_hat + m%Force( 3)*m%z_hat

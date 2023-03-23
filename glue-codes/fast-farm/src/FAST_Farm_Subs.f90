@@ -2526,7 +2526,7 @@ subroutine Farm_WriteOutput(n, t, farm, ErrStat, ErrMsg)
    ErrMsg = ""
    
    t1 = omp_get_wtime()  
-   write(*,*)  '  Farm_WriteOutput: Starting'
+   !write(*,*)  '  Farm_WriteOutput: Starting'
 
 
       ! If requested write output channel data
@@ -2799,7 +2799,7 @@ subroutine Farm_WriteOutput(n, t, farm, ErrStat, ErrMsg)
 
 
    t2 = omp_get_wtime()  
-   write(*,*)  '  Farm_WriteOutput: Done. Serial Time: '//trim(num2lstr(t2-t1))//' s'
+   !write(*,*)  '  Farm_WriteOutput: Done. Serial Time: '//trim(num2lstr(t2-t1))//' s'
 
 end subroutine Farm_WriteOutput
 !---------------------------------------------------------------------------------------------------------------------------------- 

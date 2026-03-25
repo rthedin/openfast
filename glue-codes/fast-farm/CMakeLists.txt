@@ -19,7 +19,14 @@ if (GENERATE_TYPES)
   generate_f90_types(src/FAST_Farm_Registry.txt ${CMAKE_CURRENT_LIST_DIR}/src/FAST_Farm_Types.f90 -noextrap)
 endif()
 
+if (FASTFARM_MPI)
+  set(FASTFARM_MPI_SRC src/FAST_Farm_MPI.f90)
+else()
+  set(FASTFARM_MPI_SRC src/FAST_Farm_MPI_Serial.f90)
+endif()
+
 add_executable(FAST.Farm
+  ${FASTFARM_MPI_SRC}
   src/FAST_Farm_IO.f90
   src/FAST_Farm_IO_Params.f90
   src/FAST_Farm_Subs.f90
@@ -29,6 +36,10 @@ add_executable(FAST.Farm
   src/FASTWrapper_Types.f90
 ) 
 target_link_libraries(FAST.Farm openfastlib_static wdlib awaelib)
+if (FASTFARM_MPI)
+  find_package(MPI REQUIRED)
+  target_link_libraries(FAST.Farm MPI::MPI_Fortran)
+endif()
 set_property(TARGET FAST.Farm PROPERTY LINKER_LANGUAGE Fortran)
 
 string(TOUPPER ${CMAKE_Fortran_COMPILER_ID} _compiler_id)

@@ -30,6 +30,9 @@ module AWAE
    use InflowWind
    use IfW_FlowField
    use KdTree
+#ifdef AWAE_FASTFARM_MPI
+   use mpi
+#endif
 
 #ifdef _OPENMP
    use OMP_LIB
@@ -1274,7 +1277,9 @@ subroutine AWAE_Init( InitInp, u, p, x, xd, z, OtherState, y, m, Interval, InitO
    ! Obtain the precursor grid information by parsing the necessary input files
    ! This will establish certain parameters as well as all of the initialization outputs
    ! Populates p%LowRes and p%HighRes grid information
+   call WrScr('[deb] AWAE init progress: starting AWAE_IO_InitGridInfo')
    call AWAE_IO_InitGridInfo(InitInp, p, InitOut, errStat2, errMsg2); if(Failed()) return;
+   call WrScr('[deb] AWAE init progress: completed AWAE_IO_InitGridInfo')
 
    ! --------------------------------------------------------------------------------
    ! --- Initialize states 
@@ -1724,9 +1729,67 @@ subroutine AWAE_UpdateStates(n, u, p, x, xd, z, OtherState, m, errStat, errMsg)
    real(ReKi), allocatable    :: AccUVW(:,:)
    logical                    :: WriteWindVTK
    real(DbKi)                 :: t
+   real(ReKi)                 :: DebT0, DebT1
+   real(ReKi)                 :: DebLowT0, DebLowT1, DebHighT0, DebHighT1
+   integer(IntKi), allocatable:: ReadErrLocalArr(:), ReadErrGlobalArr(:)
+   logical                    :: UseOwnerDist
+   integer(IntKi)             :: OwnerRank
+   integer(IntKi)             :: RankID, NumRanks
+#ifdef AWAE_FASTFARM_MPI
+   integer(IntKi)             :: MPIErr, MPISiKiType, MPIIntKiType
+   logical                    :: MpiIsInitialized
+#endif
    
    errStat = ErrID_None
    errMsg  = ""
+   UseOwnerDist = .false.
+   OwnerRank = 0_IntKi
+   RankID = 0_IntKi
+   NumRanks = 1_IntKi
+#ifdef AWAE_FASTFARM_MPI
+   MPIErr = MPI_SUCCESS
+   MpiIsInitialized = .false.
+   MPISiKiType = MPI_DATATYPE_NULL
+   MPIIntKiType = MPI_DATATYPE_NULL
+
+   call MPI_Initialized(MpiIsInitialized, MPIErr)
+   if (MPIErr /= MPI_SUCCESS) then
+      call SetErrStat(ErrID_Fatal, 'MPI_Initialized failed in AWAE_UpdateStates.', errStat, errMsg, RoutineName)
+      return
+   end if
+
+   if (MpiIsInitialized) then
+      call MPI_Comm_rank(MPI_COMM_WORLD, RankID, MPIErr)
+      if (MPIErr /= MPI_SUCCESS) then
+         call SetErrStat(ErrID_Fatal, 'MPI_Comm_rank failed in AWAE_UpdateStates.', errStat, errMsg, RoutineName)
+         return
+      end if
+
+      call MPI_Comm_size(MPI_COMM_WORLD, NumRanks, MPIErr)
+      if (MPIErr /= MPI_SUCCESS) then
+         call SetErrStat(ErrID_Fatal, 'MPI_Comm_size failed in AWAE_UpdateStates.', errStat, errMsg, RoutineName)
+         return
+      end if
+
+      if (NumRanks > 1_IntKi) then
+         UseOwnerDist = .true.
+
+         call MPI_Type_match_size(MPI_TYPECLASS_REAL, STORAGE_SIZE(0.0_SiKi)/8, MPISiKiType, MPIErr)
+         if (MPIErr /= MPI_SUCCESS .or. MPISiKiType == MPI_DATATYPE_NULL) then
+            call SetErrStat(ErrID_Fatal, 'MPI_Type_match_size failed for SiKi in AWAE_UpdateStates.', errStat, errMsg, RoutineName)
+            return
+         end if
+
+         call MPI_Type_match_size(MPI_TYPECLASS_INTEGER, STORAGE_SIZE(0_IntKi)/8, MPIIntKiType, MPIErr)
+         if (MPIErr /= MPI_SUCCESS .or. MPIIntKiType == MPI_DATATYPE_NULL) then
+            call SetErrStat(ErrID_Fatal, 'MPI_Type_match_size failed for IntKi in AWAE_UpdateStates.', errStat, errMsg, RoutineName)
+            return
+         end if
+      end if
+   end if
+#endif
+   call CPU_TIME(DebT0)
+   if (n <= 1_IntKi) call WrScr('[deb] AWAE_UpdateStates begin n='//trim(Num2LStr(n))//' t='//trim(Num2LStr(real(n,DbKi)*p%DT_low)))
    
    ! If last time step, don't populate high-resolution grid
    if (n == (p%NumDT - 1)) then
@@ -1741,6 +1804,7 @@ subroutine AWAE_UpdateStates(n, u, p, x, xd, z, OtherState, m, errStat, errMsg)
    !----------------------------------------------------------------------------
    ! Populate low resolution grids based on ambient wind source
    !----------------------------------------------------------------------------
+   call CPU_TIME(DebLowT0)
 
    select case (p%Mod_AmbWind)
 
@@ -1771,10 +1835,13 @@ subroutine AWAE_UpdateStates(n, u, p, x, xd, z, OtherState, m, errStat, errMsg)
       if (Failed()) return
 
    end select
+   call CPU_TIME(DebLowT1)
+   if (n <= 1_IntKi) call WrScr('[deb] AWAE_UpdateStates lowres complete n='//trim(Num2LStr(n))//' cpu_dt='//trim(Num2LStr(DebLowT1-DebLowT0)))
 
    !----------------------------------------------------------------------------
    ! Populate high-resolution grid based on ambient wind source
    !----------------------------------------------------------------------------
+   call CPU_TIME(DebHighT0)
 
    select case (p%Mod_AmbWind)
 
@@ -1876,26 +1943,114 @@ subroutine AWAE_UpdateStates(n, u, p, x, xd, z, OtherState, m, errStat, errMsg)
    case (4)
 
       ! Loop through turbines
-      do nt = 1, p%NumTurbines
+      if (UseOwnerDist) then
+         allocate(ReadErrLocalArr(p%NumTurbines), ReadErrGlobalArr(p%NumTurbines), stat=ErrStat2)
+         if (ErrStat2 /= 0) then
+            call SetErrStat(ErrID_Fatal, 'Allocation failure for AMReX read-error arrays in AWAE_UpdateStates.', errStat, errMsg, RoutineName)
+            return
+         end if
+         ReadErrLocalArr = ErrID_None
+         ReadErrGlobalArr = ErrID_None
 
-         ! Copy T=T_low_previous-DT_high (end-1 index in Vamb_high) into T=T_low_now-DT_high (0 index in Vamb_high).  Note that n starts at 0
-         if (n /= 0_IntKi) m%Vamb_high(nt)%data(:,:,:,:,0) = m%Vamb_high(nt)%data(:,:,:,:,ubound(m%Vamb_high(nt)%data,5)-1)
+         ! Phase 1: owner-only AMReX reads (parallel across MPI ranks, no collectives)
+         do nt = 1, p%NumTurbines
+            OwnerRank = mod(nt-1_IntKi, NumRanks)
 
-         ! Loop through high resolution grids
-         do i_hl = 0, n_high_low
+            if (n <= 1_IntKi .and. RankID == OwnerRank) then
+               call CPU_TIME(DebT0)
+               call WrScr('[deb] AWAE_UpdateStates AMReX high begin n='//trim(Num2LStr(n))//' turbine='//trim(Num2LStr(nt))//' owner='//trim(Num2LStr(OwnerRank))//' rank='//trim(Num2LStr(RankID)))
+            end if
 
-            call ReadWindAMReX(nt, n*p%n_high_low + i_hl, p, m%Vamb_high(nt)%data(:,:,:,:,i_hl+1), errStat2, errMsg2)
-            if (Failed()) return
+            if (n /= 0_IntKi) m%Vamb_high(nt)%data(:,:,:,:,0) = m%Vamb_high(nt)%data(:,:,:,:,ubound(m%Vamb_high(nt)%data,5)-1)
 
+            if (RankID == OwnerRank) then
+               do i_hl = 0, n_high_low
+                  call ReadWindAMReX(nt, n*p%n_high_low + i_hl, p, m%Vamb_high(nt)%data(:,:,:,:,i_hl+1), errStat2, errMsg2)
+                  if (ErrStat2 >= AbortErrLev) then
+                     ReadErrLocalArr(nt) = ErrStat2
+                     call SetErrStat(ErrStat2, ErrMsg2, errStat, errMsg, RoutineName)
+                     exit
+                  end if
+               end do
+            else
+               m%Vamb_high(nt)%data(:,:,:,:,1:n_high_low+1) = 0.0_SiKi
+            end if
+
+            if (n <= 1_IntKi .and. RankID == OwnerRank) then
+               call CPU_TIME(DebT1)
+               call WrScr('[deb] AWAE_UpdateStates AMReX high end   n='//trim(Num2LStr(n))//' turbine='//trim(Num2LStr(nt))//' cpu_dt='//trim(Num2LStr(DebT1-DebT0)))
+            end if
          end do
 
-         ! Special handling at T=0 for time slice at -DT_high.  Note that n starts at 0
-         !  -> Copy T=0 data into T=-DT_high for AD extrap/interp
-         if (n == 0_IntKi) m%Vamb_high(nt)%data(:,:,:,:,0) = m%Vamb_high(nt)%data(:,:,:,:,1)
+#ifdef AWAE_FASTFARM_MPI
+         ! Phase 2: synchronize read errors and then synchronize turbine data to all ranks
+         call MPI_Allreduce(ReadErrLocalArr, ReadErrGlobalArr, p%NumTurbines, MPIIntKiType, MPI_MAX, MPI_COMM_WORLD, MPIErr)
+         if (MPIErr /= MPI_SUCCESS) then
+            if (allocated(ReadErrLocalArr)) deallocate(ReadErrLocalArr)
+            if (allocated(ReadErrGlobalArr)) deallocate(ReadErrGlobalArr)
+            call SetErrStat(ErrID_Fatal, 'MPI_Allreduce failed for AMReX high-res error sync in AWAE_UpdateStates.', errStat, errMsg, RoutineName)
+            return
+         end if
 
-      end do
+         do nt = 1, p%NumTurbines
+            if (ReadErrGlobalArr(nt) >= AbortErrLev) then
+               if (allocated(ReadErrLocalArr)) deallocate(ReadErrLocalArr)
+               if (allocated(ReadErrGlobalArr)) deallocate(ReadErrGlobalArr)
+               if (RankID /= mod(nt-1_IntKi, NumRanks)) then
+                  call SetErrStat(ErrID_Fatal, 'Owner rank failed AMReX high-res read for turbine='//trim(Num2LStr(nt))//' in AWAE_UpdateStates.', errStat, errMsg, RoutineName)
+               end if
+               return
+            end if
+
+            call MPI_Allreduce(MPI_IN_PLACE, m%Vamb_high(nt)%data, SIZE(m%Vamb_high(nt)%data), MPISiKiType, MPI_SUM, MPI_COMM_WORLD, MPIErr)
+            if (MPIErr /= MPI_SUCCESS) then
+               if (allocated(ReadErrLocalArr)) deallocate(ReadErrLocalArr)
+               if (allocated(ReadErrGlobalArr)) deallocate(ReadErrGlobalArr)
+               call SetErrStat(ErrID_Fatal, 'MPI_Allreduce failed for AMReX high-res data sync in AWAE_UpdateStates.', errStat, errMsg, RoutineName)
+               return
+            end if
+         end do
+#endif
+
+         deallocate(ReadErrLocalArr, ReadErrGlobalArr)
+
+         do nt = 1, p%NumTurbines
+            if (n == 0_IntKi) m%Vamb_high(nt)%data(:,:,:,:,0) = m%Vamb_high(nt)%data(:,:,:,:,1)
+         end do
+
+      else
+
+         do nt = 1, p%NumTurbines
+            if (n <= 1_IntKi) then
+               call CPU_TIME(DebT0)
+               call WrScr('[deb] AWAE_UpdateStates AMReX high begin n='//trim(Num2LStr(n))//' turbine='//trim(Num2LStr(nt))//' owner=0 rank=0')
+            end if
+
+            if (n /= 0_IntKi) m%Vamb_high(nt)%data(:,:,:,:,0) = m%Vamb_high(nt)%data(:,:,:,:,ubound(m%Vamb_high(nt)%data,5)-1)
+
+            do i_hl = 0, n_high_low
+               call ReadWindAMReX(nt, n*p%n_high_low + i_hl, p, m%Vamb_high(nt)%data(:,:,:,:,i_hl+1), errStat2, errMsg2)
+               if (ErrStat2 >= AbortErrLev) then
+                  call SetErrStat(ErrStat2, ErrMsg2, errStat, errMsg, RoutineName)
+                  return
+               end if
+            end do
+
+            if (n == 0_IntKi) m%Vamb_high(nt)%data(:,:,:,:,0) = m%Vamb_high(nt)%data(:,:,:,:,1)
+
+            if (n <= 1_IntKi) then
+               call CPU_TIME(DebT1)
+               call WrScr('[deb] AWAE_UpdateStates AMReX high end   n='//trim(Num2LStr(n))//' turbine='//trim(Num2LStr(nt))//' cpu_dt='//trim(Num2LStr(DebT1-DebT0)))
+            end if
+         end do
+
+      end if
+
+      if (errStat >= AbortErrLev) return
 
    end select
+   call CPU_TIME(DebHighT1)
+   if (n <= 1_IntKi) call WrScr('[deb] AWAE_UpdateStates highres complete n='//trim(Num2LStr(n))//' cpu_dt='//trim(Num2LStr(DebHighT1-DebHighT0)))
 
    !----------------------------------------------------------------------------
    ! Propagate WAT tracer
@@ -1913,6 +2068,8 @@ subroutine AWAE_UpdateStates(n, u, p, x, xd, z, OtherState, m, errStat, errMsg)
       ! add mean velocity * dt to the tracer for the position of the WAT box
       xd%WAT_B_Box = xd%WAT_B_Box + xd%Ufarm*real(p%dt_low,ReKi)
    endif
+   call CPU_TIME(DebT1)
+   if (n <= 1_IntKi) call WrScr('[deb] AWAE_UpdateStates end n='//trim(Num2LStr(n))//' cpu_dt='//trim(Num2LStr(DebT1-DebT0)))
 
 contains
    logical function Failed()

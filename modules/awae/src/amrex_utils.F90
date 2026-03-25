@@ -3,7 +3,8 @@ use iso_c_binding
 use NWTC_Library
 
 #ifdef ENABLE_AMREX_LIB
-use amrex_base_module, only: amrex_init, amrex_finalize
+use amrex_base_module, only: amrex_base_init => amrex_init, amrex_base_finalize => amrex_finalize
+use amrex_parmparse_module, only: amrex_parmparse, amrex_parmparse_build, amrex_parmparse_destroy
 #endif
 
 implicit none
@@ -56,15 +57,38 @@ public :: amrex_read_header, amrex_read_data, amrex_find_subvols
 
 contains
 
-#ifndef ENABLE_AMREX_LIB
-
-subroutine amrex_init(arg_parmparse)
+subroutine amrex_init(arg_parmparse, root_print)
    logical, optional, intent(in) :: arg_parmparse
-end subroutine
+   logical, optional, intent(in) :: root_print
+
+#ifdef ENABLE_AMREX_LIB
+   logical :: print_this_rank
+
+   print_this_rank = .true.
+   if (present(root_print)) print_this_rank = root_print
+
+   if (print_this_rank) then
+      call amrex_base_init(arg_parmparse=arg_parmparse)
+   else
+      call amrex_base_init(arg_parmparse=arg_parmparse, proc_parmparse=amrex_set_quiet_mode)
+   end if
+#endif
+end subroutine amrex_init
 
 subroutine amrex_finalize()
-end subroutine
+#ifdef ENABLE_AMREX_LIB
+   call amrex_base_finalize()
+#endif
+end subroutine amrex_finalize
 
+#ifdef ENABLE_AMREX_LIB
+subroutine amrex_set_quiet_mode() bind(c)
+   type(amrex_parmparse) :: pp
+
+   call amrex_parmparse_build(pp, 'amrex')
+   call pp%add('verbose', 0)
+   call amrex_parmparse_destroy(pp)
+end subroutine amrex_set_quiet_mode
 #endif
 
 ! Read the header information for the AMReX grid and return it.

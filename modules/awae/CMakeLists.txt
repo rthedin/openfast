@@ -30,6 +30,12 @@ add_library(awaelib STATIC
 )
 target_link_libraries(awaelib awaelib_c ifwlib nwtclibs)
 
+if (FASTFARM_MPI)
+  find_package(MPI REQUIRED)
+  target_link_libraries(awaelib MPI::MPI_Fortran)
+  target_compile_definitions(awaelib PRIVATE AWAE_FASTFARM_MPI)
+endif()
+
 # If AMReX reader enabled, build library and link amrex_3d
 if (AMREX_READER)
   target_sources(awaelib_c PRIVATE src/amrex_utils.cpp)

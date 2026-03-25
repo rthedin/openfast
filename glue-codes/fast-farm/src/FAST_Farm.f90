@@ -26,6 +26,7 @@
 PROGRAM FAST_Farm
 
    USE FAST_Farm_Subs
+   USE FAST_Farm_MPI
    USE amrex_utils
 
    IMPLICIT NONE
@@ -38,6 +39,9 @@ INTEGER(IntKi)                        :: n_t_global                             
 INTEGER(IntKi)                        :: ErrStat                                 ! Error status
 CHARACTER(ErrMsgLen)                  :: ErrMsg                                  ! Error message
 real(dbki)                            :: t                                       ! current time
+INTEGER(IntKi)                        :: ConsoleUnit                             ! console unit for rank-local screen output
+INTEGER(IntKi)                        :: ConsoleIOStat                           ! I/O status for console redirection
+REAL(ReKi)                            :: DebCPU
 
    ! data for restart:
 CHARACTER(1024)                       :: InputFileName                           ! Rootname of the checkpoint file
@@ -69,8 +73,23 @@ type(All_FastFarm_Data)               :: farm
    CALL NWTC_Init() ! open console for writing
    ProgName = Farm_Ver%Name
 
+   call Farm_MPI_Init(ErrStat, ErrMsg)
+   if (ErrStat >= AbortErrLev) then
+      CALL WrScr( NewLine//TRIM(ErrMsg)//NewLine )
+      call ProgAbort('', TrapErrors=.FALSE., TimeWait=3._ReKi )
+   end if
+
+   call DebPrint('FAST_Farm main: MPI initialized')
+
+   if (Farm_MPI_Rank() /= 0) then
+      open(newunit=ConsoleUnit, file='/dev/null', status='old', action='write', iostat=ConsoleIOStat)
+      if (ConsoleIOStat == 0) call SetConsoleUnit(ConsoleUnit)
+   end if
+
    CALL DATE_AND_TIME ( Values=ProgStrtTime )                        ! Let's time the whole simulation
    CALL CPU_TIME ( ProgStrtCPU )                                    ! Initial time (this zeros the start time when used as a MATLAB function)
+
+   call DebPrint('FAST_Farm main: startup complete, parsing args')
    
    farm%p%NumTurbines = 0
    t = 0
@@ -84,8 +103,9 @@ type(All_FastFarm_Data)               :: farm
       call NormStop()
    endif
 
-   ! Initialize AMReX library
-   call amrex_init(arg_parmparse=.false.)
+   ! Initialize AMReX library (only rank 0 prints AMReX banners)
+   call amrex_init(arg_parmparse=.false., root_print=(Farm_MPI_Rank() == 0))
+   call DebPrint('FAST_Farm main: amrex_init complete')
 
    CALL FAST_ProgStart( Farm_Ver ) ! put this after CheckArgs because CheckArgs assumes we haven't called this routine, yet.
    
@@ -103,6 +123,7 @@ type(All_FastFarm_Data)               :: farm
       
       call Farm_Initialize( farm, InputFileName, ErrStat, ErrMsg )
          CALL CheckError( ErrStat, ErrMsg, 'during driver initialization' )
+      call DebPrint('FAST_Farm main: Farm_Initialize complete')
             
       !...............................................................................................................................
       ! Initial Calculate Output
@@ -112,6 +133,7 @@ type(All_FastFarm_Data)               :: farm
          
       call FARM_InitialCO(farm, ErrStat, ErrMsg)   
          CALL CheckError( ErrStat, ErrMsg, 'during initial calculate output' )
+      call DebPrint('FAST_Farm main: FARM_InitialCO complete')
       
    END IF
    
@@ -138,18 +160,22 @@ type(All_FastFarm_Data)               :: farm
    !   
       ! this takes data from n_t_global and gets values at n_t_global + 1
       t = n_t_global*farm%p%DT_low
+      call DebPrint('FAST_Farm main: begin FARM_UpdateStates n='//trim(Num2LStr(n_t_global))//' t='//trim(Num2LStr(t)))
       
 
       CALL FARM_UpdateStates(t, n_t_global, farm, ErrStat, ErrMsg)   
      
       CALL CheckError( ErrStat, ErrMsg  )
+      call DebPrint('FAST_Farm main: end FARM_UpdateStates n='//trim(Num2LStr(n_t_global)))
    
       t = (n_t_global+1)*farm%p%DT_low
+      call DebPrint('FAST_Farm main: begin FARM_CalcOutput n='//trim(Num2LStr(n_t_global+1))//' t='//trim(Num2LStr(t)))
       
 
       CALL FARM_CalcOutput(t, farm, ErrStat, ErrMsg)   
 
       CALL CheckError( ErrStat, ErrMsg  )
+      call DebPrint('FAST_Farm main: end FARM_CalcOutput n='//trim(Num2LStr(n_t_global+1)))
       
       CALL SimStatus( PrevSimTime, PrevClockTime, t, farm%p%TMax )
          
@@ -161,14 +187,25 @@ type(All_FastFarm_Data)               :: farm
    !...............................................................................................................................         
    
    call FARM_End(farm, ErrStat, ErrMsg)
+   call DebPrint('FAST_Farm main: FARM_End complete')
 
    ! Finalize AMReX library
    call amrex_finalize()
+   call DebPrint('FAST_Farm main: amrex_finalize complete')
+
+   call Farm_MPI_Finalize(ErrStat, ErrMsg)
    
    CALL RunTimes( ProgStrtTime, ProgStrtCPU, SimStrtTime, SimStrtCPU, t )   
    call NormStop()
    
 CONTAINS
+   subroutine DebPrint(msg)
+      character(*), intent(in) :: msg
+
+      call CPU_TIME(DebCPU)
+      call WrScr('[deb] rank='//trim(Num2LStr(Farm_MPI_Rank()))//' ts='//trim(CurDate())//' '//trim(CurTime())//' cpu='//trim(Num2LStr(DebCPU))//' '//trim(msg))
+   end subroutine DebPrint
+
    !...............................................................................................................................
    SUBROUTINE CheckError(ErrID,Msg,ErrLocMsg)
    ! This subroutine sets the error message and level and cleans up if the error is >= AbortErrLev
@@ -199,6 +236,7 @@ CONTAINS
             call FARM_End(farm, ErrStat2, ErrMsg2)                                 
             ! Finalize AMReX library
             call amrex_finalize()
+            call Farm_MPI_Abort(1_IntKi, ErrStat2, ErrMsg2)
             call ProgAbort('', TrapErrors=.FALSE., TimeWait=3._ReKi )
             
          END IF

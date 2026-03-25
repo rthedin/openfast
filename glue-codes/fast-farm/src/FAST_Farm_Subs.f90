@@ -30,6 +30,7 @@ MODULE FAST_Farm_Subs
    USE WakeDynamics
    USE AWAE
    USE FAST_Farm_IO
+   USE FAST_Farm_MPI
    USE FAST_Subs
    USE FASTWrapper
    USE InflowWind, only: InflowWind_End
@@ -42,8 +43,310 @@ MODULE FAST_Farm_Subs
    IMPLICIT NONE
 
    integer(IntKi), private, parameter  :: iED = 1
+   logical,        private, save       :: MpiSyncDebConfigured = .false.
+   logical,        private, save       :: MpiSyncDebEnabled    = .true.
    
 CONTAINS
+
+   subroutine Farm_Deb_Print(msg)
+      character(*), intent(in) :: msg
+      real(ReKi)               :: DebCPU
+
+      call CPU_TIME(DebCPU)
+      call WrScr('[deb] rank='//trim(Num2LStr(Farm_MPI_Rank()))//' ts='//trim(CurDate())//' '//trim(CurTime())//' cpu='//trim(Num2LStr(DebCPU))//' '//trim(msg))
+   end subroutine Farm_Deb_Print
+
+   logical function Farm_MpiSyncDebEnabled()
+      character(64)     :: EnvVal
+      integer(IntKi)    :: EnvLen
+      integer(IntKi)    :: EnvStat
+
+      if (.not. MpiSyncDebConfigured) then
+         EnvVal = ''
+         EnvLen = 0_IntKi
+         EnvStat = 0_IntKi
+
+         call get_environment_variable('FASTFARM_MPI_SYNC_DEB', EnvVal, length=EnvLen, status=EnvStat)
+         if (EnvStat == 0_IntKi .and. EnvLen > 0_IntKi) then
+            select case (trim(adjustl(EnvVal(1:EnvLen))))
+            case ('0','false','FALSE','off','OFF','no','NO')
+               MpiSyncDebEnabled = .false.
+            case default
+               MpiSyncDebEnabled = .true.
+            end select
+         else
+            MpiSyncDebEnabled = .true.
+         end if
+
+         MpiSyncDebConfigured = .true.
+      end if
+
+      Farm_MpiSyncDebEnabled = MpiSyncDebEnabled
+   end function Farm_MpiSyncDebEnabled
+
+   logical function Farm_UseOwnerExecution(farm)
+      type(All_FastFarm_Data), intent(in) :: farm
+
+      Farm_UseOwnerExecution = Farm_MPI_UseParallel() .and. (farm%p%MooringMod == 0)
+   end function Farm_UseOwnerExecution
+
+   subroutine Farm_Sync_FWrapOutput(farm, nt, ErrStat, ErrMsg, SyncStage)
+      type(All_FastFarm_Data), intent(inout) :: farm
+      integer(IntKi),          intent(in   ) :: nt
+      integer(IntKi),          intent(  out) :: ErrStat
+      character(*),            intent(  out) :: ErrMsg
+      character(*), optional,  intent(in   ) :: SyncStage
+
+      integer(IntKi)                        :: OwnerRank
+      integer(IntKi)                        :: ErrStat2
+      character(ErrMsgLen)                  :: ErrMsg2
+      integer(IntKi)                        :: nCt
+      integer(IntKi)                        :: nCq
+      integer(IntKi)                        :: allocStat
+      logical                               :: OwnsLocal
+      character(128)                        :: StageTag
+      character(*), parameter               :: RoutineName = 'Farm_Sync_FWrapOutput'
+
+      ErrStat = ErrID_None
+      ErrMsg  = ''
+
+      if (.not. Farm_MPI_UseParallel()) return
+
+      OwnerRank = Farm_MPI_OwnerRank(nt)
+      OwnsLocal = Farm_MPI_OwnsTurbine(nt)
+
+      StageTag = 'unknown'
+      if (present(SyncStage)) StageTag = trim(SyncStage)
+
+      if (OwnsLocal) then
+         if (allocated(farm%FWrap(nt)%y%AzimAvg_Ct)) then
+            nCt = size(farm%FWrap(nt)%y%AzimAvg_Ct)
+         else
+            nCt = 0
+         end if
+
+         if (allocated(farm%FWrap(nt)%y%AzimAvg_Cq)) then
+            nCq = size(farm%FWrap(nt)%y%AzimAvg_Cq)
+         else
+            nCq = 0
+         end if
+      else
+         nCt = 0
+         nCq = 0
+      end if
+
+      call Farm_Deb_Print('MPI_SYNC begin stage='//trim(StageTag)//' turbine='//trim(Num2LStr(nt))//' owner='//trim(Num2LStr(OwnerRank))//' owns_local='//merge('T','F',OwnsLocal)//' nCt_local='//trim(Num2LStr(nCt))//' nCq_local='//trim(Num2LStr(nCq)))
+
+      call Farm_MPI_Bcast_IntKi0(nCt, OwnerRank, ErrStat2, ErrMsg2)
+      call SetErrStat(ErrStat2, ErrMsg2, ErrStat, ErrMsg, RoutineName)
+      if (ErrStat >= AbortErrLev) return
+
+      call Farm_MPI_Bcast_IntKi0(nCq, OwnerRank, ErrStat2, ErrMsg2)
+      call SetErrStat(ErrStat2, ErrMsg2, ErrStat, ErrMsg, RoutineName)
+      if (ErrStat >= AbortErrLev) return
+
+      call Farm_Deb_Print('MPI_SYNC sizes stage='//trim(StageTag)//' turbine='//trim(Num2LStr(nt))//' nCt_global='//trim(Num2LStr(nCt))//' nCq_global='//trim(Num2LStr(nCq)))
+
+      if (nCt == 0) then
+         if (allocated(farm%FWrap(nt)%y%AzimAvg_Ct)) deallocate(farm%FWrap(nt)%y%AzimAvg_Ct)
+      else
+         if (allocated(farm%FWrap(nt)%y%AzimAvg_Ct)) then
+            if (size(farm%FWrap(nt)%y%AzimAvg_Ct) /= nCt) then
+               deallocate(farm%FWrap(nt)%y%AzimAvg_Ct)
+            end if
+         end if
+         if (.not. allocated(farm%FWrap(nt)%y%AzimAvg_Ct)) then
+            allocate(farm%FWrap(nt)%y%AzimAvg_Ct(nCt), stat=allocStat)
+            if (allocStat /= 0) then
+               call SetErrStat(ErrID_Fatal, 'Failed allocating AzimAvg_Ct before MPI sync.', ErrStat, ErrMsg, RoutineName)
+               return
+            end if
+         end if
+      end if
+
+      if (nCq == 0) then
+         if (allocated(farm%FWrap(nt)%y%AzimAvg_Cq)) deallocate(farm%FWrap(nt)%y%AzimAvg_Cq)
+      else
+         if (allocated(farm%FWrap(nt)%y%AzimAvg_Cq)) then
+            if (size(farm%FWrap(nt)%y%AzimAvg_Cq) /= nCq) then
+               deallocate(farm%FWrap(nt)%y%AzimAvg_Cq)
+            end if
+         end if
+         if (.not. allocated(farm%FWrap(nt)%y%AzimAvg_Cq)) then
+            allocate(farm%FWrap(nt)%y%AzimAvg_Cq(nCq), stat=allocStat)
+            if (allocStat /= 0) then
+               call SetErrStat(ErrID_Fatal, 'Failed allocating AzimAvg_Cq before MPI sync.', ErrStat, ErrMsg, RoutineName)
+               return
+            end if
+         end if
+      end if
+
+      call Farm_MPI_Bcast_ReKi1(farm%FWrap(nt)%y%xHat_Disk,    OwnerRank, ErrStat2, ErrMsg2)
+      call SetErrStat(ErrStat2, ErrMsg2, ErrStat, ErrMsg, RoutineName)
+      if (ErrStat >= AbortErrLev) return
+
+      call Farm_MPI_Bcast_ReKi0(farm%FWrap(nt)%y%YawErr,       OwnerRank, ErrStat2, ErrMsg2)
+      call SetErrStat(ErrStat2, ErrMsg2, ErrStat, ErrMsg, RoutineName)
+      if (ErrStat >= AbortErrLev) return
+
+      call Farm_MPI_Bcast_ReKi0(farm%FWrap(nt)%y%psi_skew,     OwnerRank, ErrStat2, ErrMsg2)
+      call SetErrStat(ErrStat2, ErrMsg2, ErrStat, ErrMsg, RoutineName)
+      if (ErrStat >= AbortErrLev) return
+
+      call Farm_MPI_Bcast_ReKi0(farm%FWrap(nt)%y%chi_skew,     OwnerRank, ErrStat2, ErrMsg2)
+      call SetErrStat(ErrStat2, ErrMsg2, ErrStat, ErrMsg, RoutineName)
+      if (ErrStat >= AbortErrLev) return
+
+      call Farm_MPI_Bcast_ReKi1(farm%FWrap(nt)%y%p_hub,        OwnerRank, ErrStat2, ErrMsg2)
+      call SetErrStat(ErrStat2, ErrMsg2, ErrStat, ErrMsg, RoutineName)
+      if (ErrStat >= AbortErrLev) return
+
+      call Farm_MPI_Bcast_ReKi0(farm%FWrap(nt)%y%D_rotor,      OwnerRank, ErrStat2, ErrMsg2)
+      call SetErrStat(ErrStat2, ErrMsg2, ErrStat, ErrMsg, RoutineName)
+      if (ErrStat >= AbortErrLev) return
+
+      call Farm_MPI_Bcast_ReKi0(farm%FWrap(nt)%y%DiskAvg_Vx_Rel, OwnerRank, ErrStat2, ErrMsg2)
+      call SetErrStat(ErrStat2, ErrMsg2, ErrStat, ErrMsg, RoutineName)
+      if (ErrStat >= AbortErrLev) return
+
+      if (nCt > 0) then
+         call Farm_MPI_Bcast_ReKi1(farm%FWrap(nt)%y%AzimAvg_Ct, OwnerRank, ErrStat2, ErrMsg2)
+         call SetErrStat(ErrStat2, ErrMsg2, ErrStat, ErrMsg, RoutineName)
+         if (ErrStat >= AbortErrLev) return
+      end if
+
+      if (nCq > 0) then
+         call Farm_MPI_Bcast_ReKi1(farm%FWrap(nt)%y%AzimAvg_Cq, OwnerRank, ErrStat2, ErrMsg2)
+         call SetErrStat(ErrStat2, ErrMsg2, ErrStat, ErrMsg, RoutineName)
+         if (ErrStat >= AbortErrLev) return
+      end if
+
+      call Farm_Deb_Print('MPI_SYNC end stage='//trim(StageTag)//' turbine='//trim(Num2LStr(nt))//' owner='//trim(Num2LStr(OwnerRank)))
+
+   end subroutine Farm_Sync_FWrapOutput
+
+   subroutine Farm_Sync_WDData(farm, nt, ErrStat, ErrMsg, SyncStage, SyncXD, SyncMisc)
+      type(All_FastFarm_Data), intent(inout) :: farm
+      integer(IntKi),          intent(in   ) :: nt
+      integer(IntKi),          intent(  out) :: ErrStat
+      character(*),            intent(  out) :: ErrMsg
+      character(*), optional,  intent(in   ) :: SyncStage
+      logical,      optional,  intent(in   ) :: SyncXD
+      logical,      optional,  intent(in   ) :: SyncMisc
+
+      integer(IntKi)                        :: OwnerRank
+      integer(IntKi)                        :: ErrStat2
+      character(ErrMsgLen)                  :: ErrMsg2
+      logical                               :: OwnsLocal
+      logical                               :: DoSyncXD
+      logical                               :: DoSyncMisc
+      character(128)                        :: StageTag
+      character(*), parameter               :: RoutineName = 'Farm_Sync_WDData'
+
+      ErrStat = ErrID_None
+      ErrMsg  = ''
+
+      if (.not. Farm_MPI_UseParallel()) return
+
+      OwnerRank = Farm_MPI_OwnerRank(nt)
+      OwnsLocal = Farm_MPI_OwnsTurbine(nt)
+      DoSyncXD = .false.
+      DoSyncMisc = .false.
+      if (present(SyncXD)) DoSyncXD = SyncXD
+      if (present(SyncMisc)) DoSyncMisc = SyncMisc
+
+      StageTag = 'unknown'
+      if (present(SyncStage)) StageTag = trim(SyncStage)
+
+      call Farm_Deb_Print('WD_SYNC begin stage='//trim(StageTag)//' turbine='//trim(Num2LStr(nt))//' owner='//trim(Num2LStr(OwnerRank))//' owns_local='//merge('T','F',OwnsLocal)//' sync_xd='//merge('T','F',DoSyncXD)//' sync_misc='//merge('T','F',DoSyncMisc))
+
+      call Farm_MPI_Bcast_ReKi0(farm%WD(nt)%y%NumPlanes, OwnerRank, ErrStat2, ErrMsg2)
+      call SetErrStat(ErrStat2, ErrMsg2, ErrStat, ErrMsg, RoutineName)
+      if (ErrStat >= AbortErrLev) return
+
+      call Farm_MPI_Bcast_ReKi2(farm%WD(nt)%y%xhat_plane, OwnerRank, ErrStat2, ErrMsg2)
+      call SetErrStat(ErrStat2, ErrMsg2, ErrStat, ErrMsg, RoutineName)
+      if (ErrStat >= AbortErrLev) return
+
+      call Farm_MPI_Bcast_ReKi2(farm%WD(nt)%y%p_plane, OwnerRank, ErrStat2, ErrMsg2)
+      call SetErrStat(ErrStat2, ErrMsg2, ErrStat, ErrMsg, RoutineName)
+      if (ErrStat >= AbortErrLev) return
+
+      call Farm_MPI_Bcast_ReKi2(farm%WD(nt)%y%Vx_wake, OwnerRank, ErrStat2, ErrMsg2)
+      call SetErrStat(ErrStat2, ErrMsg2, ErrStat, ErrMsg, RoutineName)
+      if (ErrStat >= AbortErrLev) return
+
+      call Farm_MPI_Bcast_ReKi2(farm%WD(nt)%y%Vr_wake, OwnerRank, ErrStat2, ErrMsg2)
+      call SetErrStat(ErrStat2, ErrMsg2, ErrStat, ErrMsg, RoutineName)
+      if (ErrStat >= AbortErrLev) return
+
+      call Farm_MPI_Bcast_ReKi3(farm%WD(nt)%y%Vx_wake2, OwnerRank, ErrStat2, ErrMsg2)
+      call SetErrStat(ErrStat2, ErrMsg2, ErrStat, ErrMsg, RoutineName)
+      if (ErrStat >= AbortErrLev) return
+
+      call Farm_MPI_Bcast_ReKi3(farm%WD(nt)%y%Vy_wake2, OwnerRank, ErrStat2, ErrMsg2)
+      call SetErrStat(ErrStat2, ErrMsg2, ErrStat, ErrMsg, RoutineName)
+      if (ErrStat >= AbortErrLev) return
+
+      call Farm_MPI_Bcast_ReKi3(farm%WD(nt)%y%Vz_wake2, OwnerRank, ErrStat2, ErrMsg2)
+      call SetErrStat(ErrStat2, ErrMsg2, ErrStat, ErrMsg, RoutineName)
+      if (ErrStat >= AbortErrLev) return
+
+      call Farm_MPI_Bcast_ReKi1(farm%WD(nt)%y%D_wake, OwnerRank, ErrStat2, ErrMsg2)
+      call SetErrStat(ErrStat2, ErrMsg2, ErrStat, ErrMsg, RoutineName)
+      if (ErrStat >= AbortErrLev) return
+
+      call Farm_MPI_Bcast_ReKi1(farm%WD(nt)%y%x_plane, OwnerRank, ErrStat2, ErrMsg2)
+      call SetErrStat(ErrStat2, ErrMsg2, ErrStat, ErrMsg, RoutineName)
+      if (ErrStat >= AbortErrLev) return
+
+      if (farm%p%WAT /= Mod_WAT_None) then
+         call Farm_MPI_Bcast_ReKi3(farm%WD(nt)%y%WAT_k, OwnerRank, ErrStat2, ErrMsg2)
+         call SetErrStat(ErrStat2, ErrMsg2, ErrStat, ErrMsg, RoutineName)
+         if (ErrStat >= AbortErrLev) return
+      end if
+
+      if (DoSyncXD) then
+         call Farm_MPI_Bcast_ReKi1(farm%WD(nt)%xd%Vx_wind_disk_filt, OwnerRank, ErrStat2, ErrMsg2)
+         call SetErrStat(ErrStat2, ErrMsg2, ErrStat, ErrMsg, RoutineName)
+         if (ErrStat >= AbortErrLev) return
+
+         call Farm_MPI_Bcast_ReKi0(farm%WD(nt)%xd%psi_skew_filt, OwnerRank, ErrStat2, ErrMsg2)
+         call SetErrStat(ErrStat2, ErrMsg2, ErrStat, ErrMsg, RoutineName)
+         if (ErrStat >= AbortErrLev) return
+
+         call Farm_MPI_Bcast_ReKi0(farm%WD(nt)%xd%chi_skew_filt, OwnerRank, ErrStat2, ErrMsg2)
+         call SetErrStat(ErrStat2, ErrMsg2, ErrStat, ErrMsg, RoutineName)
+         if (ErrStat >= AbortErrLev) return
+      end if
+
+      if (DoSyncMisc) then
+         call Farm_MPI_Bcast_ReKi0(farm%WD(nt)%m%GammaCurl, OwnerRank, ErrStat2, ErrMsg2)
+         call SetErrStat(ErrStat2, ErrMsg2, ErrStat, ErrMsg, RoutineName)
+         if (ErrStat >= AbortErrLev) return
+
+         call Farm_MPI_Bcast_ReKi0(farm%WD(nt)%m%Ct_avg, OwnerRank, ErrStat2, ErrMsg2)
+         call SetErrStat(ErrStat2, ErrMsg2, ErrStat, ErrMsg, RoutineName)
+         if (ErrStat >= AbortErrLev) return
+
+         if (farm%WD(nt)%p%Mod_Wake == Mod_Wake_Polar) then
+            call Farm_MPI_Bcast_ReKi2(farm%WD(nt)%m%vt_tot, OwnerRank, ErrStat2, ErrMsg2)
+            call SetErrStat(ErrStat2, ErrMsg2, ErrStat, ErrMsg, RoutineName)
+            if (ErrStat >= AbortErrLev) return
+
+            call Farm_MPI_Bcast_ReKi2(farm%WD(nt)%m%vt_amb, OwnerRank, ErrStat2, ErrMsg2)
+            call SetErrStat(ErrStat2, ErrMsg2, ErrStat, ErrMsg, RoutineName)
+            if (ErrStat >= AbortErrLev) return
+
+            call Farm_MPI_Bcast_ReKi2(farm%WD(nt)%m%vt_shr, OwnerRank, ErrStat2, ErrMsg2)
+            call SetErrStat(ErrStat2, ErrMsg2, ErrStat, ErrMsg, RoutineName)
+            if (ErrStat >= AbortErrLev) return
+         end if
+      end if
+
+      call Farm_Deb_Print('WD_SYNC end stage='//trim(StageTag)//' turbine='//trim(Num2LStr(nt))//' owner='//trim(Num2LStr(OwnerRank)))
+
+   end subroutine Farm_Sync_WDData
 
    subroutine TrilinearInterpRegGrid(V, pt, dims, val)
    
@@ -157,6 +460,8 @@ SUBROUTINE Farm_Initialize( farm, InputFile, ErrStat, ErrMsg )
    ErrStat = ErrID_None
    ErrMsg  = ""         
    AbortErrLev  = ErrID_Fatal                                 ! Until we read otherwise from the FAST input file, we abort only on FATAL errors
+
+   call Farm_Deb_Print('Farm_Initialize: begin InputFile='//trim(InputFile))
       
    
       ! ... Open and read input files, initialize global parameters. ...
@@ -183,12 +488,14 @@ SUBROUTINE Farm_Initialize( farm, InputFile, ErrStat, ErrMsg )
    !...............................................................................................................................  
       
    call Farm_ReadPrimaryFile( InputFile, farm%p, WD_InitInput%InputFileData, AWAE_InitInput%InputFileData, OutList, ErrStat2, ErrMsg2 );  if(Failed()) return;
+   call Farm_Deb_Print('Farm_Initialize: Farm_ReadPrimaryFile complete')
 
    !...............................................................................................................................  
    ! step 2: validate input & set parameters
    !...............................................................................................................................  
       
    call Farm_ValidateInput( farm%p, WD_InitInput%InputFileData, AWAE_InitInput%InputFileData, ErrStat2, ErrMsg2 );  if(Failed()) return;
+   call Farm_Deb_Print('Farm_Initialize: Farm_ValidateInput complete')
    
    farm%p%NOutTurb = min(farm%p%NumTurbines,9)  ! We only support output for the first 9 turbines, even if the farm has more than 9 
    
@@ -222,8 +529,10 @@ SUBROUTINE Farm_Initialize( farm, InputFile, ErrStat, ErrMsg )
       !-------------------
       ! a. read WAT input files using InflowWind
    if (farm%p%WAT /= Mod_WAT_None) then
+      call Farm_Deb_Print('Farm_Initialize: WAT_init begin')
       call WAT_init( farm%p, farm%WAT_IfW, AWAE_InitInput, ErrStat2, ErrMsg2 )
       if(Failed()) return;
+      call Farm_Deb_Print('Farm_Initialize: WAT_init complete')
    endif
 
       !-------------------
@@ -242,9 +551,11 @@ SUBROUTINE Farm_Initialize( farm, InputFile, ErrStat, ErrMsg )
    if (farm%p%WAT /= Mod_WAT_None .and. associated(farm%WAT_IfW%p%FlowField)) then
       AWAE_InitInput%WAT_FlowField => farm%WAT_IfW%p%FlowField
    endif
+   call Farm_Deb_Print('Farm_Initialize: AWAE_Init begin')
    call AWAE_Init( AWAE_InitInput, farm%AWAE%u, farm%AWAE%p, farm%AWAE%x, farm%AWAE%xd, farm%AWAE%z, farm%AWAE%OtherSt, farm%AWAE%y, &
                    farm%AWAE%m, farm%p%DT_low, AWAE_InitOutput, ErrStat2, ErrMsg2 )
    if(Failed()) return;
+   call Farm_Deb_Print('Farm_Initialize: AWAE_Init complete')
       
    farm%AWAE%IsInitialized = .true.
 
@@ -263,6 +574,7 @@ SUBROUTINE Farm_Initialize( farm, InputFile, ErrStat, ErrMsg )
       ! c. initialize WD (one instance per turbine, each can be done in parallel, too)
       
    call Farm_InitWD( farm, WD_InitInput, ErrStat2, ErrMsg2 );  if(Failed()) return;
+   call Farm_Deb_Print('Farm_Initialize: Farm_InitWD complete')
       
       
    !...............................................................................................................................  
@@ -270,6 +582,7 @@ SUBROUTINE Farm_Initialize( farm, InputFile, ErrStat, ErrMsg )
    !...............................................................................................................................  
 
    CALL Farm_InitFAST( farm, WD_InitInput%InputFileData, AWAE_InitOutput, ErrStat2, ErrMsg2);  if(Failed()) return;
+   call Farm_Deb_Print('Farm_Initialize: Farm_InitFAST complete')
       
    !...............................................................................................................................  
    ! step 4.5: initialize farm-level MoorDyn if applicable
@@ -277,6 +590,7 @@ SUBROUTINE Farm_Initialize( farm, InputFile, ErrStat, ErrMsg )
    
    if (farm%p%MooringMod == 3) then
       CALL Farm_InitMD( farm, ErrStat2, ErrMsg2);  if(Failed()) return;  ! FAST instances must be initialized first so that turbine initial positions are known
+      call Farm_Deb_Print('Farm_Initialize: Farm_InitMD complete')
    end if
 
    !...............................................................................................................................  
@@ -287,16 +601,19 @@ SUBROUTINE Farm_Initialize( farm, InputFile, ErrStat, ErrMsg )
    CALL Farm_SetOutParam(OutList, farm, ErrStat2, ErrMsg2 );  if(Failed()) return; ! requires: p%NumOuts, sets: p%OutParam.
       
    call Farm_InitOutput( farm, ErrStat2, ErrMsg2 );  if(Failed()) return;
+   call Farm_Deb_Print('Farm_Initialize: Farm_InitOutput complete')
 
       ! Print the summary file if requested:
    IF (farm%p%SumPrint) THEN
       CALL Farm_PrintSum( farm, WD_InitInput%InputFileData, ErrStat2, ErrMsg2 );  if(Failed()) return;
+      call Farm_Deb_Print('Farm_Initialize: Farm_PrintSum complete')
    END IF
    
    !...............................................................................................................................
    ! Destroy initializion data
    !...............................................................................................................................      
    CALL Cleanup()
+   call Farm_Deb_Print('Farm_Initialize: end')
    
 CONTAINS
    SUBROUTINE Cleanup()
@@ -602,9 +919,15 @@ SUBROUTINE Farm_InitWD( farm, WD_InitInp, ErrStat, ErrMsg )
    INTEGER(IntKi)                          :: ErrStat2                        ! Temporary Error status
    CHARACTER(ErrMsgLen)                    :: ErrMsg2                         ! Temporary Error message
    CHARACTER(*),   PARAMETER               :: RoutineName = 'Farm_InitWD'
+   REAL(ReKi)                              :: DebT0, DebT1
          
    ErrStat = ErrID_None
    ErrMsg = ""
+
+   call Farm_Deb_Print('Farm_InitWD: begin NumTurbines='//trim(Num2LStr(farm%p%NumTurbines)))
+   if (Farm_MPI_UseParallel()) then
+      call Farm_Deb_Print('Farm_InitWD: note WD_Init runs on all ranks to keep WD arrays allocated/consistent before owner-only runtime stepping')
+   end if
    
    ALLOCATE(farm%WD(farm%p%NumTurbines),STAT=ErrStat2);  if (Failed0('Wake Dynamics data')) return;
             
@@ -617,6 +940,8 @@ SUBROUTINE Farm_InitWD( farm, WD_InitInp, ErrStat, ErrMsg )
          ! initialization can be done in parallel (careful for FWrap_InitInp, though)
          !+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++         
          
+         call CPU_TIME(DebT0)
+         call Farm_Deb_Print('Farm_InitWD: begin WD_Init turbine='//trim(Num2LStr(nt)))
          WD_InitInp%TurbNum      = nt
          WD_InitInp%MaxNumPlanes = farm%p%MaxNumPlanes(nt)
          WD_InitInp%OutFileRoot  = farm%p%OutFileRoot
@@ -624,6 +949,8 @@ SUBROUTINE Farm_InitWD( farm, WD_InitInp, ErrStat, ErrMsg )
             ! note that WD_Init has Interval as INTENT(IN) so, we don't need to worry about overwriting farm%p%dt_low here:
          call WD_Init( WD_InitInp, farm%WD(nt)%u, farm%WD(nt)%p, farm%WD(nt)%x, farm%WD(nt)%xd, farm%WD(nt)%z, &
                           farm%WD(nt)%OtherSt, farm%WD(nt)%y, farm%WD(nt)%m, farm%p%dt_low, WD_InitOut, ErrStat2, ErrMsg2 )
+         call CPU_TIME(DebT1)
+         call Farm_Deb_Print('Farm_InitWD: end WD_Init turbine='//trim(Num2LStr(nt))//' cpu_dt='//trim(Num2LStr(DebT1-DebT0)))
          
          farm%WD(nt)%IsInitialized = .true.
             CALL SetErrStat(ErrStat2, ErrMsg2, ErrStat, ErrMsg, 'T'//trim(num2lstr(nt))//':'//RoutineName)
@@ -635,6 +962,8 @@ SUBROUTINE Farm_InitWD( farm, WD_InitInp, ErrStat, ErrMsg )
       END DO   
       
       farm%p%Module_Ver( ModuleFF_WD ) = WD_InitOut%Ver
+
+      call Farm_Deb_Print('Farm_InitWD: complete')
       
       call cleanup()
       
@@ -676,12 +1005,21 @@ SUBROUTINE Farm_InitFAST( farm, WD_InitInp, AWAE_InitOutput, ErrStat, ErrMsg )
    INTEGER(IntKi)                          :: ErrStat2                        ! Temporary Error status
    CHARACTER(ErrMsgLen)                    :: ErrMsg2                         ! Temporary Error message
    CHARACTER(*),   PARAMETER               :: RoutineName = 'Farm_InitFAST'
+   INTEGER(IntKi)                          :: OwnerRank
+   LOGICAL                                 :: OwnsLocal
+   LOGICAL                                 :: UseOwnerExec
+   LOGICAL                                 :: DidLocalFWrapInit
+   REAL(ReKi)                              :: DebT0, DebT1
    
    
    ErrStat = ErrID_None
    ErrMsg = ""
+
+   call Farm_Deb_Print('Farm_InitFAST: begin NumTurbines='//trim(Num2LStr(farm%p%NumTurbines)))
    
    ALLOCATE(farm%FWrap(farm%p%NumTurbines),STAT=ErrStat2);  if (Failed0('FAST Wrapper data')) return;
+   UseOwnerExec = Farm_UseOwnerExecution(farm)
+   DidLocalFWrapInit = .false.
             
       !.................
       ! Initialize each instance of FAST
@@ -704,32 +1042,47 @@ SUBROUTINE Farm_InitFAST( farm, WD_InitInp, AWAE_InitOutput, ErrStat, ErrMsg )
          ! initialization can be done in parallel (careful for FWrap_InitInp, though)
          !+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++         
          
-         FWrap_InitInp%FASTInFile    = farm%p%WT_FASTInFile(nt)
-         FWrap_InitInp%p_ref_Turbine = farm%p%WT_Position(:,nt)
-         FWrap_InitInp%WaveFieldMod  = farm%p%WaveFieldMod
-         FWrap_InitInp%TurbNum       = nt
-         FWrap_InitInp%RootName      = trim(farm%p%OutFileRoot)//'.T'//num2lstr(nt)
-         
-         FWrap_InitInp%nX_high       = AWAE_InitOutput%nXYZ_high(1,nt)
-         FWrap_InitInp%nY_high       = AWAE_InitOutput%nXYZ_high(2,nt)
-         FWrap_InitInp%nZ_high       = AWAE_InitOutput%nXYZ_high(3,nt)
+         OwnerRank = Farm_MPI_OwnerRank(nt)
+         OwnsLocal = (.not. UseOwnerExec) .or. Farm_MPI_OwnsTurbine(nt)
+         call CPU_TIME(DebT0)
+         call Farm_Deb_Print('Farm_InitFAST: begin FWrap_Init turbine='//trim(Num2LStr(nt))//' owner_rank='//trim(Num2LStr(OwnerRank))//' owns_local='//merge('T','F',OwnsLocal))
 
-         FWrap_InitInp%p_ref_high(1) = AWAE_InitOutput%oXYZ_high(1,nt)
-         FWrap_InitInp%p_ref_high(2) = AWAE_InitOutput%oXYZ_high(2,nt)
-         FWrap_InitInp%p_ref_high(3) = AWAE_InitOutput%oXYZ_high(3,nt)
+         ErrStat2 = ErrID_None
+         ErrMsg2 = ''
+         if (OwnsLocal) then
+            FWrap_InitInp%FASTInFile    = farm%p%WT_FASTInFile(nt)
+            FWrap_InitInp%p_ref_Turbine = farm%p%WT_Position(:,nt)
+            FWrap_InitInp%WaveFieldMod  = farm%p%WaveFieldMod
+            FWrap_InitInp%TurbNum       = nt
+            FWrap_InitInp%RootName      = trim(farm%p%OutFileRoot)//'.T'//num2lstr(nt)
+            
+            FWrap_InitInp%nX_high       = AWAE_InitOutput%nXYZ_high(1,nt)
+            FWrap_InitInp%nY_high       = AWAE_InitOutput%nXYZ_high(2,nt)
+            FWrap_InitInp%nZ_high       = AWAE_InitOutput%nXYZ_high(3,nt)
 
-         FWrap_InitInp%dX_high       = AWAE_InitOutput%dXYZ_high(1,nt)
-         FWrap_InitInp%dY_high       = AWAE_InitOutput%dXYZ_high(2,nt)
-         FWrap_InitInp%dZ_high       = AWAE_InitOutput%dXYZ_high(3,nt)
+            FWrap_InitInp%p_ref_high(1) = AWAE_InitOutput%oXYZ_high(1,nt)
+            FWrap_InitInp%p_ref_high(2) = AWAE_InitOutput%oXYZ_high(2,nt)
+            FWrap_InitInp%p_ref_high(3) = AWAE_InitOutput%oXYZ_high(3,nt)
 
-         FWrap_InitInp%Vdist_High   => AWAE_InitOutput%Vdist_High(nt)%data
+            FWrap_InitInp%dX_high       = AWAE_InitOutput%dXYZ_high(1,nt)
+            FWrap_InitInp%dY_high       = AWAE_InitOutput%dXYZ_high(2,nt)
+            FWrap_InitInp%dZ_high       = AWAE_InitOutput%dXYZ_high(3,nt)
 
-            ! note that FWrap_Init has Interval as INTENT(IN) so, we don't need to worry about overwriting farm%p%dt_low here:
-            ! NOTE: FWrap_interval, and FWrap_InitOut appear unused
-         call FWrap_Init( FWrap_InitInp, farm%FWrap(nt)%u, farm%FWrap(nt)%p, farm%FWrap(nt)%x, farm%FWrap(nt)%xd, farm%FWrap(nt)%z, &
-                          farm%FWrap(nt)%OtherSt, farm%FWrap(nt)%y, farm%FWrap(nt)%m, FWrap_Interval, FWrap_InitOut, ErrStat2, ErrMsg2 )
-         
+            FWrap_InitInp%Vdist_High   => AWAE_InitOutput%Vdist_High(nt)%data
+
+               ! note that FWrap_Init has Interval as INTENT(IN) so, we don't need to worry about overwriting farm%p%dt_low here:
+               ! NOTE: FWrap_interval, and FWrap_InitOut appear unused
+            call FWrap_Init( FWrap_InitInp, farm%FWrap(nt)%u, farm%FWrap(nt)%p, farm%FWrap(nt)%x, farm%FWrap(nt)%xd, farm%FWrap(nt)%z, &
+                             farm%FWrap(nt)%OtherSt, farm%FWrap(nt)%y, farm%FWrap(nt)%m, FWrap_Interval, FWrap_InitOut, ErrStat2, ErrMsg2 )
+            call CPU_TIME(DebT1)
+            call Farm_Deb_Print('Farm_InitFAST: end FWrap_Init turbine='//trim(Num2LStr(nt))//' cpu_dt='//trim(Num2LStr(DebT1-DebT0))//' err='//trim(Num2LStr(ErrStat2)))
+         else
+            farm%FWrap(nt)%IsInitialized = .false.
+            call Farm_Deb_Print('Farm_InitFAST: skip FWrap_Init turbine='//trim(Num2LStr(nt))//' on non-owner rank')
+         end if
+
          farm%FWrap(nt)%IsInitialized = .true.
+         DidLocalFWrapInit = .true.
          
          if (ErrStat2 >= AbortErrLev) then
             !OMP CRITICAL  ! Needed to avoid data race on ErrStat and ErrMsg
@@ -740,12 +1093,27 @@ SUBROUTINE Farm_InitFAST( farm, WD_InitInp, AWAE_InitOutput, ErrStat, ErrMsg )
       END DO   
       !OMP END PARALLEL DO  
 
+      if (UseOwnerExec) then
+         do nt = 1, farm%p%NumTurbines
+            call Farm_Sync_FWrapOutput(farm, nt, ErrStat2, ErrMsg2, 'InitFAST')
+            call SetErrStat(ErrStat2, ErrMsg2, ErrStat, ErrMsg, 'T'//trim(num2lstr(nt))//':'//RoutineName)
+            if (ErrStat >= AbortErrLev) then
+               call cleanup()
+               return
+            end if
+         end do
+      end if
+
       if (ErrStat >= AbortErrLev) then
          call cleanup()
          return
       end if
    
-      farm%p%Module_Ver( ModuleFF_FWrap ) = FWrap_InitOut%Ver
+      if (DidLocalFWrapInit) then
+         farm%p%Module_Ver( ModuleFF_FWrap ) = FWrap_InitOut%Ver
+      end if
+
+      call Farm_Deb_Print('Farm_InitFAST: complete')
       
       call cleanup()
       
@@ -1042,10 +1410,17 @@ subroutine FARM_InitialCO(farm, ErrStat, ErrMsg)
    INTEGER(IntKi)                          :: ErrStat2                        ! Temporary Error status
    CHARACTER(ErrMsgLen)                    :: ErrMsg2                         ! Temporary Error message
    CHARACTER(*),   PARAMETER               :: RoutineName = 'FARM_InitialCO'
+   INTEGER(IntKi)                          :: OwnerRank
+   LOGICAL                                 :: OwnsLocal
+   LOGICAL                                 :: UseOwnerExec
+   REAL(ReKi)                              :: DebT0, DebT1
    
    
    ErrStat = ErrID_None
    ErrMsg = ""
+
+   call Farm_Deb_Print('FARM_InitialCO: begin')
+   UseOwnerExec = Farm_UseOwnerExecution(farm)
    
    
 
@@ -1069,6 +1444,7 @@ subroutine FARM_InitialCO(farm, ErrStat, ErrMsg)
                      farm%AWAE%OtherSt, farm%AWAE%y, farm%AWAE%m, ErrStat2, ErrMsg2 )         
          call SetErrStat(ErrStat2, ErrMsg2, ErrStat, ErrMsg, RoutineName)
          if (ErrStat >= AbortErrLev) return
+   call Farm_Deb_Print('FARM_InitialCO: AWAE_CalcOutput #1 complete')
       !--------------------
       ! 1c. transfer y_AWAE to u_F and u_WD         
    
@@ -1079,12 +1455,32 @@ subroutine FARM_InitialCO(farm, ErrStat, ErrMsg)
    !.......................................................................................
          
    DO nt = 1,farm%p%NumTurbines
-      
-      call FWrap_t0( farm%FWrap(nt)%u, farm%FWrap(nt)%p, farm%FWrap(nt)%x, farm%FWrap(nt)%xd, farm%FWrap(nt)%z, &
-                     farm%FWrap(nt)%OtherSt, farm%FWrap(nt)%y, farm%FWrap(nt)%m, ErrStat2, ErrMsg2 )         
-         call SetErrStat(ErrStat2, ErrMsg2, ErrStat, ErrMsg, 'T'//trim(num2lstr(nt))//':'//RoutineName)
+      OwnerRank = Farm_MPI_OwnerRank(nt)
+      OwnsLocal = (.not. UseOwnerExec) .or. Farm_MPI_OwnsTurbine(nt)
+      call CPU_TIME(DebT0)
+      call Farm_Deb_Print('FARM_InitialCO: begin FWrap_t0 turbine='//trim(Num2LStr(nt)))
+
+      ErrStat2 = ErrID_None
+      ErrMsg2 = ''
+      if (OwnsLocal) then
+         call FWrap_t0( farm%FWrap(nt)%u, farm%FWrap(nt)%p, farm%FWrap(nt)%x, farm%FWrap(nt)%xd, farm%FWrap(nt)%z, &
+                        farm%FWrap(nt)%OtherSt, farm%FWrap(nt)%y, farm%FWrap(nt)%m, ErrStat2, ErrMsg2 )         
+            call SetErrStat(ErrStat2, ErrMsg2, ErrStat, ErrMsg, 'T'//trim(num2lstr(nt))//':'//RoutineName)
+      end if
+
+      call CPU_TIME(DebT1)
+      call Farm_Deb_Print('FARM_InitialCO: end FWrap_t0 turbine='//trim(Num2LStr(nt))//' cpu_dt='//trim(Num2LStr(DebT1-DebT0))//' err='//trim(Num2LStr(ErrStat2)))
                
    END DO
+
+   if (UseOwnerExec) then
+      do nt = 1, farm%p%NumTurbines
+         call Farm_Sync_FWrapOutput(farm, nt, ErrStat2, ErrMsg2, 'InitialCO_t0')
+         call SetErrStat(ErrStat2, ErrMsg2, ErrStat, ErrMsg, 'T'//trim(num2lstr(nt))//':'//RoutineName)
+         if (ErrStat >= AbortErrLev) return
+      end do
+   end if
+
    if (ErrStat >= AbortErrLev) return
    
    !.......................................................................................
@@ -1101,12 +1497,34 @@ subroutine FARM_InitialCO(farm, ErrStat, ErrMsg)
    !.......................................................................................
    
    DO nt = 1,farm%p%NumTurbines
-      
-      call WD_CalcOutput( 0.0_DbKi, farm%WD(nt)%u, farm%WD(nt)%p, farm%WD(nt)%x, farm%WD(nt)%xd, farm%WD(nt)%z, &
-                     farm%WD(nt)%OtherSt, farm%WD(nt)%y, farm%WD(nt)%m, ErrStat2, ErrMsg2 )         
-         call SetErrStat(ErrStat2, ErrMsg2, ErrStat, ErrMsg, 'T'//trim(num2lstr(nt))//':'//RoutineName)
+      OwnsLocal = (.not. UseOwnerExec) .or. Farm_MPI_OwnsTurbine(nt)
+      if (.not. OwnsLocal) then
+         if (Farm_MpiSyncDebEnabled()) call Farm_Deb_Print('FARM_InitialCO: skip WD_CalcOutput turbine='//trim(Num2LStr(nt))//' on non-owner rank')
+      end if
+      call CPU_TIME(DebT0)
+      call Farm_Deb_Print('FARM_InitialCO: begin WD_CalcOutput turbine='//trim(Num2LStr(nt)))
+
+      ErrStat2 = ErrID_None
+      ErrMsg2 = ''
+      if (OwnsLocal) then
+         call WD_CalcOutput( 0.0_DbKi, farm%WD(nt)%u, farm%WD(nt)%p, farm%WD(nt)%x, farm%WD(nt)%xd, farm%WD(nt)%z, &
+                        farm%WD(nt)%OtherSt, farm%WD(nt)%y, farm%WD(nt)%m, ErrStat2, ErrMsg2 )         
+            call SetErrStat(ErrStat2, ErrMsg2, ErrStat, ErrMsg, 'T'//trim(num2lstr(nt))//':'//RoutineName)
+      end if
+
+      call CPU_TIME(DebT1)
+      call Farm_Deb_Print('FARM_InitialCO: end WD_CalcOutput turbine='//trim(Num2LStr(nt))//' cpu_dt='//trim(Num2LStr(DebT1-DebT0))//' err='//trim(Num2LStr(ErrStat2)))
                
    END DO
+
+   if (UseOwnerExec) then
+      do nt = 1, farm%p%NumTurbines
+         call Farm_Sync_WDData(farm, nt, ErrStat2, ErrMsg2, 'InitialCO_WD_CalcOutput', .false., .true.)
+         call SetErrStat(ErrStat2, ErrMsg2, ErrStat, ErrMsg, 'T'//trim(num2lstr(nt))//':'//RoutineName)
+         if (ErrStat >= AbortErrLev) return
+      end do
+   end if
+
    if (ErrStat >= AbortErrLev) return
    
    !.......................................................................................
@@ -1123,6 +1541,7 @@ subroutine FARM_InitialCO(farm, ErrStat, ErrMsg)
                      farm%AWAE%OtherSt, farm%AWAE%y, farm%AWAE%m, ErrStat2, ErrMsg2 )         
          call SetErrStat(ErrStat2, ErrMsg2, ErrStat, ErrMsg, RoutineName)
    if (ErrStat >= AbortErrLev) return
+      call Farm_Deb_Print('FARM_InitialCO: AWAE_CalcOutput #2 complete')
    
    !.......................................................................................
    ! Transfer y_AWAE to u_F and u_WD
@@ -1136,6 +1555,8 @@ subroutine FARM_InitialCO(farm, ErrStat, ErrMsg)
    
    call Farm_WriteOutput(0, 0.0_DbKi, farm, ErrStat2, ErrMsg2)
       call SetErrStat(ErrStat2, ErrMsg2, ErrStat, ErrMsg, RoutineName)
+
+   call Farm_Deb_Print('FARM_InitialCO: end')
    
 end subroutine FARM_InitialCO
 !---------------------------------------------------------------------------------------------------------------------------------- 
@@ -1166,9 +1587,17 @@ subroutine FARM_UpdateStates(t, n, farm, ErrStat, ErrMsg)
    CHARACTER(ErrMsgLen), ALLOCATABLE       :: ErrMsgF (:)                     ! Temporary Error message for FAST
    CHARACTER(*),   PARAMETER               :: RoutineName = 'FARM_UpdateStates'
    REAL(DbKi)                              :: tm1,tm2,tm3, tm01, tm02, tm03, tmSF, tmSM  ! timer variables
+   INTEGER(IntKi)                          :: OwnerRank
+   LOGICAL                                 :: OwnsLocal
+   LOGICAL                                 :: UseOwnerExec
+   REAL(ReKi)                              :: DebT0, DebT1
    
    ErrStat = ErrID_None
    ErrMsg = ""
+
+   call Farm_Deb_Print('FARM_UpdateStates: begin n='//trim(Num2LStr(n))//' t='//trim(Num2LStr(t)))
+   UseOwnerExec = Farm_UseOwnerExecution(farm)
+   call Farm_Deb_Print('FARM_UpdateStates: owner_exec='//merge('T','F',UseOwnerExec)//' mooringMod='//trim(Num2LStr(farm%p%MooringMod)))
 
    allocate ( ErrStatF ( farm%p%NumTurbines ), STAT=errStat2 )
        if (errStat2 /= 0) call SetErrStat ( ErrID_Fatal, 'Could not allocate memory for ErrStatF.', errStat, errMsg, RoutineName )
@@ -1190,9 +1619,17 @@ subroutine FARM_UpdateStates(t, n, farm, ErrStat, ErrMsg)
    !$OMP PARALLEL default(shared)
    !$OMP do private(nt, ErrStat2, ErrMsg2) schedule(runtime)
    DO nt = 1,farm%p%NumTurbines
+      if (UseOwnerExec .and. (.not. Farm_MPI_OwnsTurbine(nt))) then
+         if (Farm_MpiSyncDebEnabled()) call Farm_Deb_Print('FARM_UpdateStates: skip WD_UpdateStates turbine='//trim(Num2LStr(nt))//' on non-owner rank')
+         cycle
+      end if
+      call CPU_TIME(DebT0)
+      call Farm_Deb_Print('FARM_UpdateStates: begin WD_UpdateStates turbine='//trim(Num2LStr(nt))//' n='//trim(Num2LStr(n)))
       
       call WD_UpdateStates( t, n, farm%WD(nt)%u, farm%WD(nt)%p, farm%WD(nt)%x, farm%WD(nt)%xd, farm%WD(nt)%z, &
                      farm%WD(nt)%OtherSt, farm%WD(nt)%m, ErrStat2, ErrMsg2 )         
+      call CPU_TIME(DebT1)
+      call Farm_Deb_Print('FARM_UpdateStates: end WD_UpdateStates turbine='//trim(Num2LStr(nt))//' cpu_dt='//trim(Num2LStr(DebT1-DebT0))//' err='//trim(Num2LStr(ErrStat2)))
 
 
       ! Error handling
@@ -1207,6 +1644,14 @@ subroutine FARM_UpdateStates(t, n, farm, ErrStat, ErrMsg)
    !$OMP END PARALLEL
    
    if (ErrStat >= AbortErrLev) return
+
+   if (UseOwnerExec) then
+      do nt = 1, farm%p%NumTurbines
+         call Farm_Sync_WDData(farm, nt, ErrStat2, ErrMsg2, 'UpdateStates_WD_Update', .true., .false.)
+         call SetErrStat(ErrStat2, ErrMsg2, ErrStat, ErrMsg, 'T'//trim(num2lstr(nt))//':'//RoutineName)
+         if (ErrStat >= AbortErrLev) return
+      end do
+   end if
    
       !--------------------
       ! 2. CALL F_Increment (and FARM_MD_Increment) and 4. CALL AWAE_UpdateStates  
@@ -1214,7 +1659,9 @@ subroutine FARM_UpdateStates(t, n, farm, ErrStat, ErrMsg)
       
    ! set the inputs needed for FAST (these are slow-varying so can just be done once per farm time step)
    do nt = 1,farm%p%NumTurbines
+      if (UseOwnerExec .and. (.not. Farm_MPI_OwnsTurbine(nt))) cycle
       call FWrap_SetWindTStart(farm%FWrap(nt)%u, farm%FWrap(nt)%m, t)
+      call Farm_Deb_Print('FARM_UpdateStates: FWrap_SetWindTStart turbine='//trim(Num2LStr(nt))//' t='//trim(Num2LStr(t)))
    end do
    
    
@@ -1228,10 +1675,25 @@ subroutine FARM_UpdateStates(t, n, farm, ErrStat, ErrMsg)
 
       !$OMP PARALLEL DO DEFAULT(Shared) Private(nt)
       DO nt = 1,farm%p%NumTurbines
+         ErrStatF(nt) = ErrID_None
+         ErrMsgF(nt) = ''
+         if (UseOwnerExec .and. (.not. Farm_MPI_OwnsTurbine(nt))) cycle
+         call CPU_TIME(DebT0)
+         call Farm_Deb_Print('FARM_UpdateStates: begin FWrap_Increment turbine='//trim(Num2LStr(nt))//' n='//trim(Num2LStr(n)))
          call FWrap_Increment( t, n, farm%FWrap(nt)%u, farm%FWrap(nt)%p, farm%FWrap(nt)%x, farm%FWrap(nt)%xd, farm%FWrap(nt)%z, &
                      farm%FWrap(nt)%OtherSt, farm%FWrap(nt)%y, farm%FWrap(nt)%m, ErrStatF(nt), ErrMsgF(nt) )         
+         call CPU_TIME(DebT1)
+         call Farm_Deb_Print('FARM_UpdateStates: end FWrap_Increment turbine='//trim(Num2LStr(nt))//' cpu_dt='//trim(Num2LStr(DebT1-DebT0))//' err='//trim(Num2LStr(ErrStatF(nt))))
       END DO
       !$OMP END PARALLEL DO  
+
+      if (UseOwnerExec) then
+         do nt = 1, farm%p%NumTurbines
+            call Farm_Sync_FWrapOutput(farm, nt, ErrStat2, ErrMsg2, 'UpdateStates_Increment')
+            call SetErrStat(ErrStat2, ErrMsg2, ErrStat, ErrMsg, 'T'//trim(num2lstr(nt))//':'//RoutineName)
+            if (ErrStat >= AbortErrLev) return
+         end do
+      end if
    
    ! Farm-level moorings case using MoorDyn
    else if (farm%p%MooringMod == 3) then
@@ -1250,10 +1712,25 @@ subroutine FARM_UpdateStates(t, n, farm, ErrStat, ErrMsg)
          ! A nested parallel for loop to call each instance of OpenFAST in parallel
          !$OMP PARALLEL DO DEFAULT(Shared) Private(nt)
          DO nt = 1,farm%p%NumTurbines
+            ErrStatF(nt) = ErrID_None
+            ErrMsgF(nt) = ''
+            if (UseOwnerExec .and. (.not. Farm_MPI_OwnsTurbine(nt))) cycle
+            call CPU_TIME(DebT0)
+            call Farm_Deb_Print('FARM_UpdateStates: begin FWrap_Increment(substep) turbine='//trim(Num2LStr(nt))//' n_FMD='//trim(Num2LStr(n_FMD))//' t='//trim(Num2LStr(t2)))
             call FWrap_Increment( t2, n_FMD, farm%FWrap(nt)%u, farm%FWrap(nt)%p, farm%FWrap(nt)%x, farm%FWrap(nt)%xd, farm%FWrap(nt)%z, &
                         farm%FWrap(nt)%OtherSt, farm%FWrap(nt)%y, farm%FWrap(nt)%m, ErrStatF(nt), ErrMsgF(nt) )         
+            call CPU_TIME(DebT1)
+            call Farm_Deb_Print('FARM_UpdateStates: end FWrap_Increment(substep) turbine='//trim(Num2LStr(nt))//' cpu_dt='//trim(Num2LStr(DebT1-DebT0))//' err='//trim(Num2LStr(ErrStatF(nt))))
          END DO              
          !$OMP END PARALLEL DO
+
+         if (UseOwnerExec) then
+            do nt = 1, farm%p%NumTurbines
+               call Farm_Sync_FWrapOutput(farm, nt, ErrStat2, ErrMsg2, 'UpdateStates_IncrementSubstep')
+               call SetErrStat(ErrStat2, ErrMsg2, ErrStat, ErrMsg, 'T'//trim(num2lstr(nt))//':'//RoutineName)
+               if (ErrStat >= AbortErrLev) return
+            end do
+         end if
          
          !#ifdef printthreads
          !   tm02 = omp_get_wtime()  
@@ -1261,6 +1738,7 @@ subroutine FARM_UpdateStates(t, n, farm, ErrStat, ErrMsg)
       
          ! call farm-level MoorDyn time step here (can't multithread this with FAST since it needs inputs from all FAST instances)
          call Farm_MD_Increment( t2, n_FMD, farm, ErrStatMD, ErrMsgMD)
+         call Farm_Deb_Print('FARM_UpdateStates: Farm_MD_Increment n_FMD='//trim(Num2LStr(n_FMD))//' err='//trim(Num2LStr(ErrStatMD)))
          call SetErrStat(ErrStatMD, ErrMsgMD, ErrStat, ErrMsg, 'FARM_UpdateStates')  ! MD error status <<<<<
          
          !#ifdef printthreads
@@ -1293,12 +1771,27 @@ subroutine FARM_UpdateStates(t, n, farm, ErrStat, ErrMsg)
    
    ! calculate outputs from FAST as needed by FAST.Farm
    do nt = 1,farm%p%NumTurbines
+      if (UseOwnerExec .and. (.not. Farm_MPI_OwnsTurbine(nt))) cycle
+      call CPU_TIME(DebT0)
+      call Farm_Deb_Print('FARM_UpdateStates: begin FWrap_CalcOutput turbine='//trim(Num2LStr(nt)))
       call FWrap_CalcOutput(farm%FWrap(nt)%p, farm%FWrap(nt)%u, farm%FWrap(nt)%y, farm%FWrap(nt)%m, ErrStat2, ErrMsg2)  
          call setErrStat(ErrStat2,ErrMsg2,ErrStat,ErrMsg,RoutineName)
+      call CPU_TIME(DebT1)
+      call Farm_Deb_Print('FARM_UpdateStates: end FWrap_CalcOutput turbine='//trim(Num2LStr(nt))//' cpu_dt='//trim(Num2LStr(DebT1-DebT0))//' err='//trim(Num2LStr(ErrStat2)))
    end do
+
+   if (UseOwnerExec) then
+      do nt = 1, farm%p%NumTurbines
+         call Farm_Sync_FWrapOutput(farm, nt, ErrStat2, ErrMsg2, 'UpdateStates_CalcOutput')
+         call SetErrStat(ErrStat2, ErrMsg2, ErrStat, ErrMsg, 'T'//trim(num2lstr(nt))//':'//RoutineName)
+         if (ErrStat >= AbortErrLev) return
+      end do
+   end if
 
    
    if (ErrStat >= AbortErrLev) return
+
+   call Farm_Deb_Print('FARM_UpdateStates: end n='//trim(Num2LStr(n)))
 
    
 end subroutine FARM_UpdateStates
@@ -1587,14 +2080,22 @@ subroutine FARM_CalcOutput(t, farm, ErrStat, ErrMsg)
    CHARACTER(ErrMsgLen)                    :: ErrMsg2                         ! Temporary Error message
    CHARACTER(*),   PARAMETER               :: RoutineName = 'FARM_CalcOutput'
    INTEGER(IntKi)                          :: n                               ! time step increment number
+   LOGICAL                                 :: OwnsLocal
+   LOGICAL                                 :: UseOwnerExec
+   REAL(ReKi)                              :: DebT0, DebT1
 !   REAL(DbKi)                              :: tm1
    ErrStat = ErrID_None
    ErrMsg = ""
+
+   call Farm_Deb_Print('FARM_CalcOutput: begin t='//trim(Num2LStr(t)))
+   UseOwnerExec = Farm_UseOwnerExecution(farm)
+   call Farm_Deb_Print('FARM_CalcOutput: owner_exec='//merge('T','F',UseOwnerExec)//' mooringMod='//trim(Num2LStr(farm%p%MooringMod)))
    
   ! tm1 = omp_get_wtime()
    
    ! Determine time step number
    n = nint(t/farm%p%DT_low)
+   call Farm_Deb_Print('FARM_CalcOutput: n='//trim(Num2LStr(n)))
 
    !.......................................................................................
    ! calculate module outputs and perform some input-output solves (steps 1. and 2. and 3. can be done in parallel,
@@ -1606,9 +2107,17 @@ subroutine FARM_CalcOutput(t, farm, ErrStat, ErrMsg)
    
    !$OMP PARALLEL DO DEFAULT (shared) PRIVATE(nt, ErrStat2, ErrMsg2) schedule(runtime)
    DO nt = 1,farm%p%NumTurbines
+      if (UseOwnerExec .and. (.not. Farm_MPI_OwnsTurbine(nt))) then
+         if (Farm_MpiSyncDebEnabled()) call Farm_Deb_Print('FARM_CalcOutput: skip WD_CalcOutput turbine='//trim(Num2LStr(nt))//' on non-owner rank')
+         cycle
+      end if
+      call CPU_TIME(DebT0)
+      call Farm_Deb_Print('FARM_CalcOutput: begin WD_CalcOutput turbine='//trim(Num2LStr(nt))//' n='//trim(Num2LStr(n)))
       
       call WD_CalcOutput( t, farm%WD(nt)%u, farm%WD(nt)%p, farm%WD(nt)%x, farm%WD(nt)%xd, farm%WD(nt)%z, &
                      farm%WD(nt)%OtherSt, farm%WD(nt)%y, farm%WD(nt)%m, ErrStat2, ErrMsg2 )         
+      call CPU_TIME(DebT1)
+      call Farm_Deb_Print('FARM_CalcOutput: end WD_CalcOutput turbine='//trim(Num2LStr(nt))//' cpu_dt='//trim(Num2LStr(DebT1-DebT0))//' err='//trim(Num2LStr(ErrStat2)))
       if (ErrStat2 >= AbortErrLev) then
          !$OMP CRITICAL  ! Needed to avoid data race on ErrStat and ErrMsg
          call SetErrStat(ErrStat2, ErrMsg2, ErrStat, ErrMsg, 'T'//trim(num2lstr(nt))//':'//RoutineName)       
@@ -1618,10 +2127,24 @@ subroutine FARM_CalcOutput(t, farm, ErrStat, ErrMsg)
    !$OMP END PARALLEL DO  
    if (ErrStat >= AbortErrLev) return
 
+   if (UseOwnerExec) then
+      do nt = 1, farm%p%NumTurbines
+         call Farm_Sync_WDData(farm, nt, ErrStat2, ErrMsg2, 'CalcOutput_WD_CalcOutput', .false., .true.)
+         call SetErrStat(ErrStat2, ErrMsg2, ErrStat, ErrMsg, 'T'//trim(num2lstr(nt))//':'//RoutineName)
+         if (ErrStat >= AbortErrLev) return
+      end do
+   end if
+
    ! IO operation, not done using OpenMP
    DO nt = 1,farm%p%NumTurbines
+      OwnsLocal = (.not. UseOwnerExec) .or. Farm_MPI_OwnsTurbine(nt)
+      if (.not. OwnsLocal) cycle
+      call CPU_TIME(DebT0)
+      call Farm_Deb_Print('FARM_CalcOutput: begin WD_WritePlaneOutputs turbine='//trim(Num2LStr(nt)))
       call WD_WritePlaneOutputs( t, farm%WD(nt)%u, farm%WD(nt)%p, farm%WD(nt)%x, farm%WD(nt)%xd, farm%WD(nt)%z, &
                      farm%WD(nt)%OtherSt, farm%WD(nt)%y, farm%WD(nt)%m, ErrStat2, ErrMsg2 )         
+      call CPU_TIME(DebT1)
+      call Farm_Deb_Print('FARM_CalcOutput: end WD_WritePlaneOutputs turbine='//trim(Num2LStr(nt))//' cpu_dt='//trim(Num2LStr(DebT1-DebT0))//' err='//trim(Num2LStr(ErrStat2)))
       if (ErrStat2 >= AbortErrLev) then
          call SetErrStat(ErrStat2, ErrMsg2, ErrStat, ErrMsg, 'T'//trim(num2lstr(nt))//':'//RoutineName)       
       endif
@@ -1630,11 +2153,13 @@ subroutine FARM_CalcOutput(t, farm, ErrStat, ErrMsg)
 
 
    call Transfer_WD_to_AWAE(farm)
+   call Farm_Deb_Print('FARM_CalcOutput: Transfer_WD_to_AWAE complete')
    
       !--------------------
       ! 2. Transfer y_F to u_WD         
          
    call Transfer_FAST_to_WD(farm)
+   call Farm_Deb_Print('FARM_CalcOutput: Transfer_FAST_to_WD complete')
          
    !.......................................................................................
    ! calculate AWAE outputs and perform rest of input-output solves
@@ -1642,19 +2167,28 @@ subroutine FARM_CalcOutput(t, farm, ErrStat, ErrMsg)
    
       !--------------------
       ! 0. call AWAE_UpdateStates to get the ambient wind and calculate wake-grid interactions
+   call CPU_TIME(DebT0)
+   call Farm_Deb_Print('FARM_CalcOutput: begin AWAE_UpdateStates n='//trim(Num2LStr(n)))
    call AWAE_UpdateStates( n, farm%AWAE%u, farm%AWAE%p, farm%AWAE%x, farm%AWAE%xd, farm%AWAE%z, &
                      farm%AWAE%OtherSt, farm%AWAE%m, ErrStat2, ErrMsg2 )    
          call SetErrStat(ErrStat2, ErrMsg2, ErrStat, ErrMsg, RoutineName)
+   call CPU_TIME(DebT1)
+   call Farm_Deb_Print('FARM_CalcOutput: end AWAE_UpdateStates n='//trim(Num2LStr(n))//' cpu_dt='//trim(Num2LStr(DebT1-DebT0))//' err='//trim(Num2LStr(ErrStat2)))
 
       !--------------------
       ! 1. call AWAE_CO 
+   call CPU_TIME(DebT0)
+   call Farm_Deb_Print('FARM_CalcOutput: begin AWAE_CalcOutput n='//trim(Num2LStr(n)))
    call AWAE_CalcOutput( t, farm%AWAE%u, farm%AWAE%p, farm%AWAE%x, farm%AWAE%xd, farm%AWAE%z, &
                      farm%AWAE%OtherSt, farm%AWAE%y, farm%AWAE%m, ErrStat2, ErrMsg2 )         
          call SetErrStat(ErrStat2, ErrMsg2, ErrStat, ErrMsg, RoutineName)
+   call CPU_TIME(DebT1)
+   call Farm_Deb_Print('FARM_CalcOutput: end AWAE_CalcOutput n='//trim(Num2LStr(n))//' cpu_dt='//trim(Num2LStr(DebT1-DebT0))//' err='//trim(Num2LStr(ErrStat2)))
 
       !--------------------
       ! 2. Transfer y_AWAE to u_F  and u_WD   
    call Transfer_AWAE_to_WD(farm)   
+   call Farm_Deb_Print('FARM_CalcOutput: Transfer_AWAE_to_WD complete')
    
    
    !.......................................................................................
@@ -1663,6 +2197,7 @@ subroutine FARM_CalcOutput(t, farm, ErrStat, ErrMsg)
       ! NOTE: Visualization data is output via the AWAE module
    call Farm_WriteOutput(n, t, farm, ErrStat2, ErrMsg2)
       call SetErrStat(ErrStat2, ErrMsg2, ErrStat, ErrMsg, RoutineName)
+   call Farm_Deb_Print('FARM_CalcOutput: Farm_WriteOutput complete err='//trim(Num2LStr(ErrStat2)))
    
    !.......................................................................................
    ! Write shared moorings visualization
@@ -1690,6 +2225,8 @@ subroutine FARM_CalcOutput(t, farm, ErrStat, ErrMsg)
    endif
 
  !  write(*,*) 'Total Farm_CO-serial took '//trim(num2lstr(omp_get_wtime()-tm1))//' seconds.' 
+
+    call Farm_Deb_Print('FARM_CalcOutput: end n='//trim(Num2LStr(n)))
    
 end subroutine FARM_CalcOutput
 !----------------------------------------------------------------------------------------------------------------------------------
@@ -1710,11 +2247,14 @@ subroutine FARM_End(farm, ErrStat, ErrMsg)
    INTEGER(IntKi)                          :: ErrStat2                        ! Temporary Error status
    CHARACTER(ErrMsgLen)                    :: ErrMsg2                         ! Temporary Error message
    CHARACTER(*),   PARAMETER               :: RoutineName = 'FARM_End'
+   LOGICAL                                 :: UseOwnerExec
    
    
    
    ErrStat = ErrID_None
    ErrMsg = ""
+   UseOwnerExec = Farm_UseOwnerExecution(farm)
+   call Farm_Deb_Print('FARM_End: owner_exec='//merge('T','F',UseOwnerExec)//' mooringMod='//trim(Num2LStr(farm%p%MooringMod)))
    
    !.......................................................................................
    ! end all modules (1-4 can be done in parallel) 
@@ -1742,6 +2282,10 @@ subroutine FARM_End(farm, ErrStat, ErrMsg)
       ! 3. end WakeDynamics
    if (allocated(farm%WD)) then
       DO nt = 1,farm%p%NumTurbines
+         if (UseOwnerExec .and. (.not. Farm_MPI_OwnsTurbine(nt))) then
+            if (Farm_MpiSyncDebEnabled()) call Farm_Deb_Print('FARM_End: skip WD_End turbine='//trim(Num2LStr(nt))//' on non-owner rank')
+            cycle
+         end if
          if (farm%WD(nt)%IsInitialized) then      
             call WD_End( farm%WD(nt)%u, farm%WD(nt)%p, farm%WD(nt)%x, farm%WD(nt)%xd, farm%WD(nt)%z, &
                          farm%WD(nt)%OtherSt, farm%WD(nt)%y, farm%WD(nt)%m, ErrStat2, ErrMsg2 )
@@ -1755,6 +2299,7 @@ subroutine FARM_End(farm, ErrStat, ErrMsg)
       ! 5. End each instance of FAST (each instance of FAST can be done in parallel, too)   
    if (allocated(farm%FWrap)) then
       DO nt = 1,farm%p%NumTurbines
+         if (UseOwnerExec .and. (.not. Farm_MPI_OwnsTurbine(nt))) cycle
          if (farm%FWrap(nt)%IsInitialized) then
             CALL FWrap_End( farm%FWrap(nt)%u, farm%FWrap(nt)%p, farm%FWrap(nt)%x, farm%FWrap(nt)%xd, farm%FWrap(nt)%z, &
                             farm%FWrap(nt)%OtherSt, farm%FWrap(nt)%y, farm%FWrap(nt)%m, ErrStat2, ErrMsg2 )

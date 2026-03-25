@@ -26,6 +26,9 @@ MODULE AWAE_IO
    use NWTC_Library
    use VTK
    use AWAE_Types
+#ifdef AWAE_FASTFARM_MPI
+   use mpi
+#endif
    use iso_c_binding, only: c_char, c_int, c_double, c_float, c_null_char
    use amrex_utils
    
@@ -250,9 +253,92 @@ subroutine AWAE_IO_InitGridInfo(InitInp, p, InitOut, errStat, errMsg)
    integer(IntKi)                             :: nChunkPointsX, nChunkPointsY
    integer(IntKi), allocatable                :: ChunkIndicesX(:,:), ChunkIndicesY(:,:)
    integer(IntKi)                             :: StartIndexNum, IndexDelta
+   integer(IntKi), allocatable                :: HRDimsLocal(:,:), HRDimsGlobal(:,:)
+   integer(IntKi), allocatable                :: HRIndexDeltaLocal(:), HRIndexDeltaGlobal(:)
+   integer(IntKi), allocatable                :: HRErrLocal(:), HRErrGlobal(:)
+   real(ReKi), allocatable                    :: HROriginLocal(:,:), HROriginGlobal(:,:)
+   real(ReKi), allocatable                    :: HRSpacingLocal(:,:), HRSpacingGlobal(:,:)
+   logical                                    :: UseOwnerDist
+   integer(IntKi)                             :: OwnerRank
+   integer(IntKi)                             :: RankID, NumRanks
+#ifdef AWAE_FASTFARM_MPI
+   integer(IntKi)                             :: MPIErr
+   logical                                    :: MpiIsInitialized
+   integer(IntKi)                             :: MPIReKiType, MPIIntKiType
+#endif
    
    errStat = ErrID_None
    errMsg  = ""
+
+   UseOwnerDist = .false.
+   OwnerRank = 0_IntKi
+   RankID = 0_IntKi
+   NumRanks = 1_IntKi
+#ifdef AWAE_FASTFARM_MPI
+   MPIErr = MPI_SUCCESS
+   MpiIsInitialized = .false.
+   MPIReKiType = MPI_DATATYPE_NULL
+   MPIIntKiType = MPI_DATATYPE_NULL
+
+   call MPI_Initialized(MpiIsInitialized, MPIErr)
+   if (MPIErr /= MPI_SUCCESS) then
+      call SetErrStat(ErrID_Fatal, 'MPI_Initialized failed in AWAE_IO_InitGridInfo.', errStat, errMsg, RoutineName)
+      return
+   end if
+
+   if (MpiIsInitialized) then
+      call MPI_Comm_rank(MPI_COMM_WORLD, RankID, MPIErr)
+      if (MPIErr /= MPI_SUCCESS) then
+         call SetErrStat(ErrID_Fatal, 'MPI_Comm_rank failed in AWAE_IO_InitGridInfo.', errStat, errMsg, RoutineName)
+         return
+      end if
+
+      call MPI_Comm_size(MPI_COMM_WORLD, NumRanks, MPIErr)
+      if (MPIErr /= MPI_SUCCESS) then
+         call SetErrStat(ErrID_Fatal, 'MPI_Comm_size failed in AWAE_IO_InitGridInfo.', errStat, errMsg, RoutineName)
+         return
+      end if
+
+      if (NumRanks > 1_IntKi) then
+         UseOwnerDist = .true.
+
+         call MPI_Type_match_size(MPI_TYPECLASS_REAL, STORAGE_SIZE(0.0_ReKi)/8, MPIReKiType, MPIErr)
+         if (MPIErr /= MPI_SUCCESS .or. MPIReKiType == MPI_DATATYPE_NULL) then
+            call SetErrStat(ErrID_Fatal, 'MPI_Type_match_size failed for ReKi in AWAE_IO_InitGridInfo.', errStat, errMsg, RoutineName)
+            return
+         end if
+
+         call MPI_Type_match_size(MPI_TYPECLASS_INTEGER, STORAGE_SIZE(0_IntKi)/8, MPIIntKiType, MPIErr)
+         if (MPIErr /= MPI_SUCCESS .or. MPIIntKiType == MPI_DATATYPE_NULL) then
+            call SetErrStat(ErrID_Fatal, 'MPI_Type_match_size failed for IntKi in AWAE_IO_InitGridInfo.', errStat, errMsg, RoutineName)
+            return
+         end if
+      end if
+   end if
+#endif
+
+   call WrScr('[deb] AWAE init progress: entering AWAE_IO_InitGridInfo')
+
+   allocate(HRDimsLocal(3, p%NumTurbines), HRDimsGlobal(3, p%NumTurbines), &
+            HRIndexDeltaLocal(p%NumTurbines), HRIndexDeltaGlobal(p%NumTurbines), &
+            HRErrLocal(p%NumTurbines), HRErrGlobal(p%NumTurbines), &
+            HROriginLocal(3, p%NumTurbines), HROriginGlobal(3, p%NumTurbines), &
+            HRSpacingLocal(3, p%NumTurbines), HRSpacingGlobal(3, p%NumTurbines), stat=ErrStat2)
+   if (ErrStat2 /= 0) then
+      call SetErrStat(ErrID_Fatal, 'Allocation failure for AWAE high-res metadata sync arrays.', errStat, errMsg, RoutineName)
+      return
+   end if
+
+   HRDimsLocal = 0_IntKi
+   HRDimsGlobal = 0_IntKi
+   HRIndexDeltaLocal = 0_IntKi
+   HRIndexDeltaGlobal = 0_IntKi
+   HRErrLocal = 0_IntKi
+   HRErrGlobal = 0_IntKi
+   HROriginLocal = 0.0_ReKi
+   HROriginGlobal = 0.0_ReKi
+   HRSpacingLocal = 0.0_ReKi
+   HRSpacingGlobal = 0.0_ReKi
    
    !============================================================================
    ! Low-resolution grid
@@ -291,15 +377,70 @@ subroutine AWAE_IO_InitGridInfo(InitInp, p, InitOut, errStat, errMsg)
    ! AMReX-based inflow
    case (4)
 
-      ! Read first low-res file
-      FileName = trim(p%WindFilePath)//"_0_"//p%DirStartIndex
-      call amrex_read_header(FileName, Time, dims, gridSpacing, origin, ErrStat2, ErrMsg2)
-      if (Failed()) return
+      if (UseOwnerDist) then
+         OwnerRank = 0_IntKi
+         if (RankID == OwnerRank) then
+            FileName = trim(p%WindFilePath)//"_0_"//p%DirStartIndex
+            call WrScr('[deb] AWAE init progress: reading AMReX low-res header file='//trim(FileName))
+            call amrex_read_header(FileName, Time, dims, gridSpacing, origin, ErrStat2, ErrMsg2)
+            if (ErrStat2 < AbortErrLev) then
+               call WrScr('[deb] AWAE init progress: completed AMReX low-res header')
+               call WrScr('[deb] AWAE init progress: scanning AMReX low-res subvolumes')
+               call amrex_find_subvols(p%WindFilePath, 0, p%dt_low, p%NumDT, p%DirStartIndex, &
+                                       StartIndexNum, p%DirIndexDeltaLow, ErrStat2, ErrMsg2)
+            end if
+            if (ErrStat2 < AbortErrLev) then
+               call WrScr('[deb] AWAE init progress: completed AMReX low-res subvolume scan')
+            end if
+         end if
 
-      ! Search directory for time slices of this sub-volume
-      call amrex_find_subvols(p%WindFilePath, 0, p%dt_low, p%NumDT, p%DirStartIndex, &
-                              StartIndexNum, p%DirIndexDeltaLow, ErrStat2, ErrMsg2)
-      if (Failed()) return
+#ifdef AWAE_FASTFARM_MPI
+         call MPI_Bcast(ErrStat2, 1, MPIIntKiType, OwnerRank, MPI_COMM_WORLD, MPIErr)
+         if (MPIErr /= MPI_SUCCESS) then
+            call SetErrStat(ErrID_Fatal, 'MPI_Bcast failed for AMReX low-res error status.', errStat, errMsg, RoutineName)
+            return
+         end if
+         if (ErrStat2 >= AbortErrLev) then
+            call SetErrStat(ErrID_Fatal, 'AMReX low-res metadata read failed on owner rank.', errStat, errMsg, RoutineName)
+            return
+         end if
+
+         call MPI_Bcast(dims, SIZE(dims), MPIIntKiType, OwnerRank, MPI_COMM_WORLD, MPIErr)
+         if (MPIErr /= MPI_SUCCESS) then
+            call SetErrStat(ErrID_Fatal, 'MPI_Bcast failed for AMReX low-res dims.', errStat, errMsg, RoutineName)
+            return
+         end if
+         call MPI_Bcast(gridSpacing, SIZE(gridSpacing), MPIReKiType, OwnerRank, MPI_COMM_WORLD, MPIErr)
+         if (MPIErr /= MPI_SUCCESS) then
+            call SetErrStat(ErrID_Fatal, 'MPI_Bcast failed for AMReX low-res spacing.', errStat, errMsg, RoutineName)
+            return
+         end if
+         call MPI_Bcast(origin, SIZE(origin), MPIReKiType, OwnerRank, MPI_COMM_WORLD, MPIErr)
+         if (MPIErr /= MPI_SUCCESS) then
+            call SetErrStat(ErrID_Fatal, 'MPI_Bcast failed for AMReX low-res origin.', errStat, errMsg, RoutineName)
+            return
+         end if
+         call MPI_Bcast(p%DirIndexDeltaLow, 1, MPIIntKiType, OwnerRank, MPI_COMM_WORLD, MPIErr)
+         if (MPIErr /= MPI_SUCCESS) then
+            call SetErrStat(ErrID_Fatal, 'MPI_Bcast failed for AMReX low-res index delta.', errStat, errMsg, RoutineName)
+            return
+         end if
+#endif
+      else
+         ! Read first low-res file
+         FileName = trim(p%WindFilePath)//"_0_"//p%DirStartIndex
+         call WrScr('[deb] AWAE init progress: reading AMReX low-res header file='//trim(FileName))
+         call amrex_read_header(FileName, Time, dims, gridSpacing, origin, ErrStat2, ErrMsg2)
+         if (Failed()) return
+         call WrScr('[deb] AWAE init progress: completed AMReX low-res header')
+
+         ! Search directory for time slices of this sub-volume
+         call WrScr('[deb] AWAE init progress: scanning AMReX low-res subvolumes')
+         call amrex_find_subvols(p%WindFilePath, 0, p%dt_low, p%NumDT, p%DirStartIndex, &
+                                 StartIndexNum, p%DirIndexDeltaLow, ErrStat2, ErrMsg2)
+         if (Failed()) return
+         call WrScr('[deb] AWAE init progress: completed AMReX low-res subvolume scan')
+      end if
 
    end select
 
@@ -462,6 +603,86 @@ subroutine AWAE_IO_InitGridInfo(InitInp, p, InitOut, errStat, errMsg)
    !----------------------------------------------------------------------------
    ! Loop through high-resolution grids (one per turbine)
    !----------------------------------------------------------------------------
+   call WrScr('[deb] AWAE init progress: reading high-res grid metadata for '//trim(Num2LStr(p%NumTurbines))//' turbines')
+
+   if (p%Mod_AmbWind == 4 .and. UseOwnerDist) then
+      call WrScr('[deb] AWAE init progress: owner-parallel AMReX high-res metadata read begin')
+
+      do nt = 1, p%NumTurbines
+         OwnerRank = mod(max(0_IntKi, nt-1_IntKi), max(1_IntKi, NumRanks))
+         call WrScr('[deb] AWAE init progress: BEGIN AMReX high-res turbine '//trim(Num2LStr(nt))//' of '//trim(Num2LStr(p%NumTurbines))//' rank='//trim(Num2LStr(RankID))//' owner='//trim(Num2LStr(OwnerRank))//' local='//merge('1','0',RankID == OwnerRank))
+         if (RankID /= OwnerRank) cycle
+
+         ErrStat2 = ErrID_None
+         ErrMsg2 = ''
+         IndexDelta = 0_IntKi
+
+         call WrScr('[deb] AWAE init progress: rank='//trim(Num2LStr(RankID))//' reading turbine '//trim(Num2LStr(nt))//' of '//trim(Num2LStr(p%NumTurbines))//' owner='//trim(Num2LStr(OwnerRank)))
+
+         FileName = trim(p%WindFilePath)//"_"//trim(Num2LStr(nt))//"_"//p%DirStartIndex
+         call amrex_read_header(FileName, Time, dims, gridSpacing, origin, ErrStat2, ErrMsg2)
+         if (ErrStat2 >= AbortErrLev) then
+            HRErrLocal(nt) = ErrStat2
+            cycle
+         end if
+
+         call amrex_find_subvols(p%WindFilePath, nt, p%dt_high, p%NumDT*p%n_high_low-1, p%DirStartIndex, &
+                                 StartIndexNum, IndexDelta, ErrStat2, ErrMsg2)
+         if (ErrStat2 >= AbortErrLev) then
+            HRErrLocal(nt) = ErrStat2
+            cycle
+         end if
+
+         call WrScr('[deb] AWAE init progress: turbine '//trim(Num2LStr(nt))//' completed subvolume scan indexDelta='//trim(Num2LStr(IndexDelta))//' rank='//trim(Num2LStr(RankID))//' owner='//trim(Num2LStr(OwnerRank))//' local=1')
+
+         HRDimsLocal(:,nt) = dims
+         HRSpacingLocal(:,nt) = gridSpacing
+         HROriginLocal(:,nt) = origin
+         HRIndexDeltaLocal(nt) = IndexDelta
+      end do
+
+#ifdef AWAE_FASTFARM_MPI
+      call MPI_Allreduce(HRErrLocal, HRErrGlobal, p%NumTurbines, MPIIntKiType, MPI_MAX, MPI_COMM_WORLD, MPIErr)
+      if (MPIErr /= MPI_SUCCESS) then
+         call SetErrStat(ErrID_Fatal, 'MPI_Allreduce failed for AMReX high-res error sync.', errStat, errMsg, RoutineName)
+         return
+      end if
+
+      do nt = 1, p%NumTurbines
+         if (HRErrGlobal(nt) >= AbortErrLev) then
+            call SetErrStat(ErrID_Fatal, 'AMReX high-res metadata read failed for turbine '//trim(Num2LStr(nt))//'.', errStat, errMsg, RoutineName)
+            return
+         end if
+      end do
+
+      call MPI_Allreduce(HRDimsLocal, HRDimsGlobal, SIZE(HRDimsLocal), MPIIntKiType, MPI_SUM, MPI_COMM_WORLD, MPIErr)
+      if (MPIErr /= MPI_SUCCESS) then
+         call SetErrStat(ErrID_Fatal, 'MPI_Allreduce failed for AMReX high-res dims sync.', errStat, errMsg, RoutineName)
+         return
+      end if
+
+      call MPI_Allreduce(HRIndexDeltaLocal, HRIndexDeltaGlobal, p%NumTurbines, MPIIntKiType, MPI_SUM, MPI_COMM_WORLD, MPIErr)
+      if (MPIErr /= MPI_SUCCESS) then
+         call SetErrStat(ErrID_Fatal, 'MPI_Allreduce failed for AMReX high-res index-delta sync.', errStat, errMsg, RoutineName)
+         return
+      end if
+
+      call MPI_Allreduce(HROriginLocal, HROriginGlobal, SIZE(HROriginLocal), MPIReKiType, MPI_SUM, MPI_COMM_WORLD, MPIErr)
+      if (MPIErr /= MPI_SUCCESS) then
+         call SetErrStat(ErrID_Fatal, 'MPI_Allreduce failed for AMReX high-res origin sync.', errStat, errMsg, RoutineName)
+         return
+      end if
+
+      call MPI_Allreduce(HRSpacingLocal, HRSpacingGlobal, SIZE(HRSpacingLocal), MPIReKiType, MPI_SUM, MPI_COMM_WORLD, MPIErr)
+      if (MPIErr /= MPI_SUCCESS) then
+         call SetErrStat(ErrID_Fatal, 'MPI_Allreduce failed for AMReX high-res spacing sync.', errStat, errMsg, RoutineName)
+         return
+      end if
+#endif
+
+      call WrScr('[deb] AWAE init progress: owner-parallel AMReX high-res metadata read complete')
+   end if
+
    do nt = 1, p%NumTurbines 
 
       ! Get high-res grid origin, dimensions, and spacing based on wind type
@@ -496,14 +717,29 @@ subroutine AWAE_IO_InitGridInfo(InitInp, p, InitOut, errStat, errMsg)
       ! AMReX-based wind
       case (4)
 
-         FileName = trim(p%WindFilePath)//"_"//trim(Num2LStr(nt))//"_"//p%DirStartIndex
-         call amrex_read_header(FileName, Time, dims, gridSpacing, origin, ErrStat2, ErrMsg2)
-         if (Failed()) return
+         if (UseOwnerDist) then
+            OwnerRank = mod(max(0_IntKi, nt-1_IntKi), max(1_IntKi, NumRanks))
+            dims = HRDimsGlobal(:,nt)
+            gridSpacing = HRSpacingGlobal(:,nt)
+            origin = HROriginGlobal(:,nt)
+            IndexDelta = HRIndexDeltaGlobal(nt)
+            call WrScr('[deb] AWAE init progress: synchronized metadata turbine '//trim(Num2LStr(nt))//' of '//trim(Num2LStr(p%NumTurbines))//' indexDelta='//trim(Num2LStr(IndexDelta))//' rank='//trim(Num2LStr(RankID))//' owner='//trim(Num2LStr(OwnerRank))//' local='//merge('1','0',RankID == OwnerRank))
+         else
+            call WrScr('[deb] AWAE init progress: BEGIN AMReX high-res turbine '//trim(Num2LStr(nt))//' of '//trim(Num2LStr(p%NumTurbines)))
 
-         ! Search directory for time slices of this sub-volume
-         call amrex_find_subvols(p%WindFilePath, nt, p%dt_high, p%NumDT*p%n_high_low-1, p%DirStartIndex, &
-                                 StartIndexNum, IndexDelta, ErrStat2, ErrMsg2)
-         if (Failed()) return
+            FileName = trim(p%WindFilePath)//"_"//trim(Num2LStr(nt))//"_"//p%DirStartIndex
+            call WrScr('[deb] AWAE init progress: turbine '//trim(Num2LStr(nt))//' read header file='//trim(FileName))
+            call amrex_read_header(FileName, Time, dims, gridSpacing, origin, ErrStat2, ErrMsg2)
+            if (Failed()) return
+            call WrScr('[deb] AWAE init progress: turbine '//trim(Num2LStr(nt))//' completed header read')
+
+            ! Search directory for time slices of this sub-volume
+            call WrScr('[deb] AWAE init progress: turbine '//trim(Num2LStr(nt))//' begin subvolume scan')
+            call amrex_find_subvols(p%WindFilePath, nt, p%dt_high, p%NumDT*p%n_high_low-1, p%DirStartIndex, &
+                                    StartIndexNum, IndexDelta, ErrStat2, ErrMsg2)
+            if (Failed()) return
+            call WrScr('[deb] AWAE init progress: turbine '//trim(Num2LStr(nt))//' completed subvolume scan indexDelta='//trim(Num2LStr(IndexDelta)))
+         end if
 
          ! If first turbine, save index delta, otherwise ensure that it is the same
          if (nt == 1) then
@@ -512,6 +748,12 @@ subroutine AWAE_IO_InitGridInfo(InitInp, p, InitOut, errStat, errMsg)
             call SetErrStat(ErrID_Fatal, "got different index delta for sub-volume "//trim(Num2LStr(nt))//" than for sub-volume 1", &
                             ErrStat, ErrMsg, RoutineName)
             return
+         end if
+
+         if (UseOwnerDist) then
+            call WrScr('[deb] AWAE init progress: END AMReX high-res turbine '//trim(Num2LStr(nt))//' of '//trim(Num2LStr(p%NumTurbines))//' rank='//trim(Num2LStr(RankID))//' owner='//trim(Num2LStr(OwnerRank))//' local='//merge('1','0',RankID == OwnerRank))
+         else
+            call WrScr('[deb] AWAE init progress: END AMReX high-res turbine '//trim(Num2LStr(nt))//' of '//trim(Num2LStr(p%NumTurbines)))
          end if
 
       end select
@@ -615,6 +857,8 @@ subroutine AWAE_IO_InitGridInfo(InitInp, p, InitOut, errStat, errMsg)
          end select
       end if
    end do   
+
+   call WrScr('[deb] AWAE init progress: completed AWAE_IO_InitGridInfo')
 
 contains
 

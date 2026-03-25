@@ -4,6 +4,7 @@ module FAST_Farm_IO
    USE VersionInfo
    USE FAST_Farm_Types
    USE FAST_Farm_IO_Params
+   USE FAST_Farm_MPI
    
    IMPLICIT NONE
    
@@ -11,6 +12,10 @@ module FAST_Farm_IO
 
    integer, parameter :: maxOutputPoints = 9
    integer, parameter :: maxOutputPlanes = 999     ! Allow up to 99 outpt planes
+   integer(IntKi), save :: OutBFlushEvery = 10_IntKi
+   integer(IntKi), save :: OutBFlushCounter = 0_IntKi
+   integer(IntKi), save :: OutBLastFlushedNOut = 0_IntKi
+   logical,        save :: OutBFlushConfigured = .false.
 
 
       contains
@@ -43,6 +48,12 @@ SUBROUTINE Farm_PrintSum( farm, WD_InputFileData, ErrStat, ErrMsg )
    CHARACTER(3)                 :: outStr
    CHARACTER(10)                :: CalWakeDiamStr
    CHARACTER(100)               :: strModDescr
+
+   if (Farm_MPI_Rank() /= 0) then
+      ErrStat = ErrID_None
+      ErrMsg  = ''
+      return
+   end if
    
    ! Open the summary file and give it a heading.
    
@@ -232,10 +243,32 @@ SUBROUTINE Farm_InitOutput( farm, ErrStat, ErrMsg )
    INTEGER(IntKi)                   :: indxLast                                        ! The index of the last value to be written to an array
    INTEGER(IntKi)                   :: indxNext                                        ! The index of the next value to be written to an array
    INTEGER(IntKi)                   :: NumOuts                                         ! number of channels to be written to the output file(s)
+   CHARACTER(64)                    :: FlushEnv
+   CHARACTER(64)                    :: ParallelTag
+   INTEGER(IntKi)                   :: FlushEnvLen, FlushEnvStat, FlushEnvIOS
+   INTEGER(IntKi)                   :: FlushEveryTmp
    
    if ( (farm%p%NumOuts == 0) ) then ! .or. .not. ( (farm%p%WrTxtOutFile) .or. (farm%p%WrBinOutFile) ) ) then
       return
    end if
+
+   if (.not. OutBFlushConfigured) then
+      OutBFlushEvery = 10_IntKi
+      FlushEnv = ''
+      FlushEnvLen = 0_IntKi
+      FlushEnvStat = 0_IntKi
+      call get_environment_variable('FASTFARM_OUTB_FLUSH_EVERY', FlushEnv, length=FlushEnvLen, status=FlushEnvStat)
+      if (FlushEnvStat == 0_IntKi .and. FlushEnvLen > 0_IntKi) then
+         read(FlushEnv(1:FlushEnvLen), *, iostat=FlushEnvIOS) FlushEveryTmp
+         if (FlushEnvIOS == 0_IntKi) then
+            OutBFlushEvery = max(1_IntKi, FlushEveryTmp)
+         end if
+      end if
+      OutBFlushConfigured = .true.
+   end if
+
+   OutBFlushCounter = 0_IntKi
+   OutBLastFlushedNOut = 0_IntKi
    
    ALLOCATE ( farm%m%AllOuts(0:Farm_MaxOutPts) , STAT=ErrStat )
       IF ( ErrStat /= 0 )  THEN
@@ -246,11 +279,18 @@ SUBROUTINE Farm_InitOutput( farm, ErrStat, ErrMsg )
       
       
    farm%m%AllOuts = 0.0_ReKi
-#ifdef _OPENMP  
-   farm%p%FileDescLines(1)  = 'Predictions were generated on '//CurDate()//' at '//CurTime()//' using '//TRIM(GetVersion(Farm_Ver))//' and with OpenMP'
-#else
-   farm%p%FileDescLines(1)  = 'Predictions were generated on '//CurDate()//' at '//CurTime()//' using '//TRIM(GetVersion(Farm_Ver))
-#endif 
+         ParallelTag = ''
+         if (Farm_MPI_UseParallel()) then
+            ParallelTag = ' with MPI'
+#ifdef _OPENMP
+            ParallelTag = TRIM(ParallelTag)//' and OpenMP'
+#endif
+         else
+#ifdef _OPENMP
+            ParallelTag = ' with OpenMP'
+#endif
+         end if
+         farm%p%FileDescLines(1)  = 'Predictions were generated on '//CurDate()//' at '//CurTime()//' using '//TRIM(GetVersion(Farm_Ver))//TRIM(ParallelTag)
    
    farm%p%FileDescLines(2)  = 'linked with ' //' '//TRIM(GetNVD(NWTC_Ver            ))  ! we'll get the rest of the linked modules in the section below
    farm%p%FileDescLines(3)  = 'Description from the FAST.Farm input file: '//TRIM(farm%p%FTitle)
@@ -259,7 +299,7 @@ SUBROUTINE Farm_InitOutput( farm, ErrStat, ErrMsg )
    ! Open the text output file and print the headers
    !......................................................
 
-  ! IF (farm%p%WrTxtOutFile) THEN
+   if (farm%p%WrTxtOutFile .and. Farm_MPI_Rank() == 0) then
 
       CALL GetNewUnit( farm%p%UnOu, ErrStat, ErrMsg )
          IF ( ErrStat >= AbortErrLev ) RETURN
@@ -345,38 +385,27 @@ SUBROUTINE Farm_InitOutput( farm, ErrStat, ErrMsg )
       
       WRITE (farm%p%UnOu,'()')
 
-  ! END IF
+   end if
 
-   ! TODO: Add binary
    !......................................................
    ! Allocate data for binary output file
    !......................................................
-   !IF (farm%p%WrBinOutFile) THEN
-   !
-   !      ! calculate the size of the array of outputs we need to store
-   !   farm%p%NOutSteps = CEILING ( (farm%p%TMax - farm%p%TStart) / farm%p%DT_low ) + 1
-   !
-   !   CALL AllocAry( farm%m%AllOutData, farm%p%NumOuts-1, farm%p%NOutSteps, 'AllOutData', ErrStat, ErrMsg )
-   !   IF ( ErrStat >= AbortErrLev ) RETURN
-   !
-   !  ! IF ( OutputFileFmtID == FileFmtID_WithoutTime ) THEN
-   !
-   !      CALL AllocAry( farm%m%TimeData, 2_IntKi, 'TimeData', ErrStat, ErrMsg )
-   !      IF ( ErrStat >= AbortErrLev ) RETURN
-   !
-   !      farm%m%TimeData(1) = 0.0_DbKi           ! This is the first output time, which we will set later
-   !      farm%m%TimeData(2) = farm%p%DT_low      ! This is the (constant) time between subsequent writes to the output file
-   !
-   !   !ELSE  ! we store the entire time array
-   !   !
-   !   !   CALL AllocAry( farm%m%TimeData, farm%p%NOutSteps, 'TimeData', ErrStat, ErrMsg )
-   !   !   IF ( ErrStat >= AbortErrLev ) RETURN
-   !   !
-   !   !END IF
-   !
-   !   farm%m%n_Out = 0  !number of steps actually written to the file
-   !
-   !END IF
+   if (farm%p%WrBinOutFile .and. Farm_MPI_Rank() == 0) then
+
+         ! calculate the size of the array of outputs we need to store
+      farm%p%NOutSteps = CEILING ( (farm%p%TMax - farm%p%TStart) / farm%p%DT_low ) + 1
+
+      CALL AllocAry( farm%m%AllOutData, farm%p%NumOuts, farm%p%NOutSteps, 'AllOutData', ErrStat, ErrMsg )
+      IF ( ErrStat >= AbortErrLev ) RETURN
+
+      CALL AllocAry( farm%m%TimeData, 2_IntKi, 'TimeData', ErrStat, ErrMsg )
+      IF ( ErrStat >= AbortErrLev ) RETURN
+
+      farm%m%TimeData(1) = 0.0_DbKi           ! This is the first output time, which we will set later
+      farm%m%TimeData(2) = farm%p%DT_low      ! This is the (constant) time between subsequent writes to the output file
+      farm%m%n_Out = 0  !number of steps actually written to the file
+
+   end if
 
 
 
@@ -395,12 +424,6 @@ SUBROUTINE Farm_EndOutput( farm, ErrStat, ErrMsg )
    INTEGER(IntKi),           INTENT(OUT)   :: ErrStat                   !< Error status
    CHARACTER(*),             INTENT(OUT)   :: ErrMsg                    !< Message associated with errro status
 
-      ! local variables
-   CHARACTER(1024)  :: FileDesc                  ! The description of the run, to be written in the binary output file
-
-   !CHARACTER(ChanLenFF):: ChannelNames(farm%p%NumOuts)
-   !CHARACTER(ChanLenFF):: ChannelUnits(farm%p%NumOuts)
-   !INTEGER(IntKi)  :: I
       ! Initialize some values
 
    ErrStat = ErrID_None
@@ -409,28 +432,13 @@ SUBROUTINE Farm_EndOutput( farm, ErrStat, ErrMsg )
    !-------------------------------------------------------------------------------------------------
    ! Write the binary output file if requested
    !-------------------------------------------------------------------------------------------------
-   ! TODO: The ChannelNames and ChannelUnits need to be length ChanLenFF for Fast.Farm, but the WrBinFAST subroutine needs these to be ChanLen long!
-   !IF (farm%p%WrBinOutFile .AND. farm%m%n_Out > 0) THEN
-   !
-   !   FileDesc = TRIM(farm%p%FileDescLines(1))//' '//TRIM(farm%p%FileDescLines(2))//'; '//TRIM(farm%p%FileDescLines(3))
-   !
-   !   DO I = 1,farm%p%NumOuts
-   !      ChannelNames(I) = farm%p%OutParam(I)%Name
-   !      ChannelUnits(I) = farm%p%OutParam(I)%Units
-   !   END DO
-   !   
-   !   CALL WrBinFAST(TRIM(farm%p%OutFileRoot)//'.outb', 2, TRIM(FileDesc), &
-   !         ChannelNames, ChannelUnits, farm%m%TimeData(:),farm%m%AllOutData(:,1:farm%m%n_Out), ErrStat, ErrMsg)
-   !
-   !   IF ( ErrStat /= ErrID_None ) CALL WrScr( TRIM(GetErrStr(ErrStat))//' when writing binary output file: '//TRIM(ErrMsg) )
-   !
-   !END IF
+   call Farm_FlushBinaryOutput(farm, .true., ErrStat, ErrMsg)
 
 
    !-------------------------------------------------------------------------------------------------
    ! Close the text tabular output file and summary file (if opened)
    !-------------------------------------------------------------------------------------------------
-   IF (farm%p%UnOu  > 0) THEN ! I/O unit number for the tabular output file
+   IF (farm%p%UnOu  > 0 .AND. Farm_MPI_Rank() == 0) THEN ! I/O unit number for the tabular output file
       CLOSE( farm%p%UnOu )         
       farm%p%UnOu = -1
    END IF
@@ -440,10 +448,8 @@ SUBROUTINE Farm_EndOutput( farm, ErrStat, ErrMsg )
    !-------------------------------------------------------------------------------------------------
 
       ! Output
-   !IF ( ALLOCATED(y_FAST%AllOutData                  ) ) DEALLOCATE(y_FAST%AllOutData                  )
-   !IF ( ALLOCATED(y_FAST%TimeData                    ) ) DEALLOCATE(y_FAST%TimeData                    )
-   !IF ( ALLOCATED(y_FAST%ChannelNames                ) ) DEALLOCATE(y_FAST%ChannelNames                )
-   !IF ( ALLOCATED(y_FAST%ChannelUnits                ) ) DEALLOCATE(y_FAST%ChannelUnits                )
+   IF ( ALLOCATED(farm%m%AllOutData                  ) ) DEALLOCATE(farm%m%AllOutData                  )
+   IF ( ALLOCATED(farm%m%TimeData                    ) ) DEALLOCATE(farm%m%TimeData                    )
 
 
 END SUBROUTINE Farm_EndOutput
@@ -479,9 +485,13 @@ SUBROUTINE WriteFarmOutputToFile( t_global, farm, ErrStat, ErrMsg )
    IF ( farm%p%NumOuts == 0 ) return
    
    IF ( t_global >= farm%p%TStart )  THEN
+
+      if (Farm_MPI_Rank() /= 0) return
       
-      WRITE( TmpStr, '('//trim(farm%p%OutFmt_t)//')' ) t_global
-      CALL WrFileNR( farm%p%UnOu, TmpStr )
+      if (farm%p%WrTxtOutFile) then
+         WRITE( TmpStr, '('//trim(farm%p%OutFmt_t)//')' ) t_global
+         CALL WrFileNR( farm%p%UnOu, TmpStr )
+      end if
 
             ! Generate fast.farm output file
       
@@ -497,7 +507,9 @@ SUBROUTINE WriteFarmOutputToFile( t_global, farm, ErrStat, ErrMsg )
      
       ENDDO             ! I - All selected output channels
         ! write the individual module output (convert to SiKi if necessary, so that we don't need to print so many digits in the exponent)
-      CALL WrNumAryFileNR ( farm%p%UnOu, REAL(OutputAry,SiKi), Frmt, ErrStat, ErrMsg ) 
+      if (farm%p%WrTxtOutFile) then
+         CALL WrNumAryFileNR ( farm%p%UnOu, REAL(OutputAry,SiKi), Frmt, ErrStat, ErrMsg )
+      end if
 !============================================================
 ! DEBUG OUTPUTS HERE
 !
@@ -522,32 +534,88 @@ SUBROUTINE WriteFarmOutputToFile( t_global, farm, ErrStat, ErrMsg )
 ! END DEBUG OUTPUTS 
 !============================================================
          ! write a new line (advance to the next line)
-      WRITE (farm%p%UnOu,'()')
+      if (farm%p%WrTxtOutFile) then
+         WRITE (farm%p%UnOu,'()')
+      end if
 
-      !IF (farm%p%WrBinOutFile) THEN
-      !
-      !      ! Write data to array for binary output file
-      !
-      !   IF ( farm%m%n_Out == farm%p%NOutSteps ) THEN
-      !      CALL ProgWarn( 'Not all data could be written to the binary output file.' )
-      !      !this really would only happen if we have an error somewhere else, right?
-      !      !otherwise, we could allocate a new, larger array and move existing data
-      !   ELSE
-      !      farm%m%n_Out = farm%m%n_Out + 1
-      !
-      !         ! store time data
-      !      IF ( farm%m%n_Out == 1_IntKi ) THEN !.OR. OutputFileFmtID == FileFmtID_WithTime ) THEN
-      !         farm%m%TimeData(farm%m%n_Out) = t_global   ! Time associated with these outputs
-      !      END IF
-      !
-      !         ! store individual module data
-      !      farm%m%AllOutData(:, farm%m%n_Out) = OutputAry
-      !   
-      !   END IF      
-      !
-      !END IF  
+      if (farm%p%WrBinOutFile) then
+
+            ! Write data to array for binary output file
+         IF ( farm%m%n_Out == farm%p%NOutSteps ) THEN
+            CALL ProgWarn( 'Not all data could be written to the binary output file.' )
+         ELSE
+            farm%m%n_Out = farm%m%n_Out + 1
+            OutBFlushCounter = OutBFlushCounter + 1
+
+               ! store time data
+            IF ( farm%m%n_Out == 1_IntKi ) THEN
+               farm%m%TimeData(1) = t_global   ! First output time
+            END IF
+
+               ! store individual module data
+            farm%m%AllOutData(:, farm%m%n_Out) = OutputAry
+
+            if (mod(OutBFlushCounter, OutBFlushEvery) == 0_IntKi) then
+               call Farm_FlushBinaryOutput(farm, .false., ErrStat2, ErrMsg2)
+               call SetErrStat(ErrStat2, ErrMsg2, ErrStat, ErrMsg, RoutineName)
+            end if
+
+         END IF
+
+      end if
    ENDIF
 END SUBROUTINE WriteFarmOutputToFile  
+
+!----------------------------------------------------------------------------------------------------------------------------------
+SUBROUTINE Farm_FlushBinaryOutput( farm, ForceWrite, ErrStat, ErrMsg )
+   type(All_FastFarm_Data),  INTENT(INOUT) :: farm
+   LOGICAL,                  INTENT(IN   ) :: ForceWrite
+   INTEGER(IntKi),           INTENT(  OUT) :: ErrStat
+   CHARACTER(*),             INTENT(  OUT) :: ErrMsg
+
+   CHARACTER(1024)                         :: FileDesc
+   CHARACTER(ChanLen), ALLOCATABLE         :: ChannelNames(:)
+   CHARACTER(ChanLen), ALLOCATABLE         :: ChannelUnits(:)
+   INTEGER(IntKi)                          :: I
+   CHARACTER(*), PARAMETER                 :: RoutineName = 'Farm_FlushBinaryOutput'
+
+   ErrStat = ErrID_None
+   ErrMsg  = ''
+
+   if (.not. farm%p%WrBinOutFile) return
+   if (Farm_MPI_Rank() /= 0) return
+   if (farm%m%n_Out <= 0) return
+   if (.not. ForceWrite) then
+      if (farm%m%n_Out <= OutBLastFlushedNOut) return
+   end if
+
+   FileDesc = TRIM(farm%p%FileDescLines(1))//' '//TRIM(farm%p%FileDescLines(2))//'; '//TRIM(farm%p%FileDescLines(3))
+
+   allocate(ChannelNames(farm%p%NumOuts), ChannelUnits(farm%p%NumOuts), stat=ErrStat)
+   if (ErrStat /= 0) then
+      ErrStat = ErrID_Fatal
+      ErrMsg = 'Error allocating memory for binary channel metadata.'
+      return
+   end if
+
+   DO I = 1,farm%p%NumOuts
+      ChannelNames(I) = farm%p%OutParam(I)%Name
+      ChannelUnits(I) = farm%p%OutParam(I)%Units
+   END DO
+
+   CALL WrBinFAST(TRIM(farm%p%OutFileRoot)//'.outb', FileFmtID_ChanLen_In, TRIM(FileDesc), &
+         ChannelNames, ChannelUnits, farm%m%TimeData(:), farm%m%AllOutData(:,1:farm%m%n_Out), ErrStat, ErrMsg)
+
+   if (allocated(ChannelNames)) deallocate(ChannelNames)
+   if (allocated(ChannelUnits)) deallocate(ChannelUnits)
+
+   IF ( ErrStat /= ErrID_None ) THEN
+      CALL WrScr( TRIM(GetErrStr(ErrStat))//' when writing binary output file: '//TRIM(ErrMsg) )
+      RETURN
+   END IF
+
+   OutBLastFlushedNOut = farm%m%n_Out
+END SUBROUTINE Farm_FlushBinaryOutput
 
 !----------------------------------------------------------------------------------------------------------------------------------
 !> This routine reads in the primary FAST.Farm input file, does some validation, and places the values it reads in the
@@ -969,12 +1037,6 @@ SUBROUTINE Farm_ReadPrimaryFile( InputFile, p, WD_InitInp, AWAE_InitInp, OutList
             !   RETURN
             !end if
       END SELECT
-
-      if ( OutFileFmt /= 1_IntKi ) then ! TODO: Only allow text format for now; add binary format later.
-         CALL SetErrStat( ErrID_Fatal, "FAST.Farm's OutFileFmt must be 1.",ErrStat,ErrMsg,RoutineName)
-         call cleanup()
-         RETURN
-      end if
 
    CALL ReadVar( UnIn, InputFile, TabDelim, "TabDelim", "Use tab delimiters in text tabular output file? (flag) {uses spaces if False}", ErrStat2, ErrMsg2, UnEc); if (Failed()) return
       IF ( TabDelim ) THEN

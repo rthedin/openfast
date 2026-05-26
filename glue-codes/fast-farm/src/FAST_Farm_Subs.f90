@@ -211,7 +211,7 @@ SUBROUTINE Farm_Initialize( farm, InputFile, ErrStat, ErrMsg )
    call AllocAry( farm%p%MaxNumPlanes, farm%p%NumTurbines, 'farm%p%MaxNumPlanes', ErrStat2, ErrMsg2);  CALL SetErrStat( ErrStat2, ErrMsg2, ErrStat, ErrMsg, RoutineName); if (Failed()) return
    do i=1,farm%p%NumTurbines
       ! Eventually, we will have different settings for different rotors
-      if (farm%WD(nt)%p%Mod_Wake == Mod_Wake_Polar) then
+      if (farm%WD(i)%p%Mod_Wake == Mod_Wake_Polar) then
          farm%p%MaxNumPlanes(i) = ceiling( 15.0 * ( WD_InitInput%InputFileData%NumDFull + WD_InitInput%InputFileData%NumDBuff ) / AWAE_InitInput%InputFileData%C_Meander )
       else
          farm%p%MaxNumPlanes(i) = ceiling( 45.0 * ( WD_InitInput%InputFileData%NumDFull + WD_InitInput%InputFileData%NumDBuff ) / AWAE_InitInput%InputFileData%C_Meander )

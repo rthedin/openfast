@@ -21,6 +21,7 @@ use, intrinsic :: iso_fortran_env, only: error_unit
 use testdrive, only: run_testsuite, new_testsuite, testsuite_type
 
 use test_ExtInfw_LineLoadsToPoints, only: test_ExtInfw_LineLoadsToPoints_suite
+use test_ExtInfw_VelNodes, only: test_ExtInfw_VelNodes_suite
 use NWTC_Num
 
 implicit none
@@ -33,7 +34,8 @@ stat = 0
 call SetConstants()
 
 testsuites = [ &
-             new_testsuite("ExtInfw_LineLoadsToPoints", test_ExtInfw_LineLoadsToPoints_suite) &
+             new_testsuite("ExtInfw_LineLoadsToPoints", test_ExtInfw_LineLoadsToPoints_suite), &
+             new_testsuite("ExtInfw_VelNodes", test_ExtInfw_VelNodes_suite) &
              ]
 
 do is = 1, size(testsuites)

@@ -34,6 +34,8 @@ MODULE ExternalInflow
    PUBLIC :: ExtInfw_SetWriteOutput
    PUBLIC :: ExtInfw_UpdateFlowField
    PUBLIC :: ExtInfw_LineLoadsToPoints              ! Loads of the actuator force points from the AeroDyn line loads
+   PUBLIC :: ExtInfw_NumVelNodes                    ! Number of points the external driver provides the velocity at
+   PUBLIC :: ExtInfw_SetVelNodePositions            ! Positions of these points
 
 CONTAINS
 !----------------------------------------------------------------------------------------------------------------------------------
@@ -79,26 +81,8 @@ SUBROUTINE Init_ExtInfw( InitInp, p_FAST, AirDens, u_AD, initOut_AD, y_AD, ExtIn
       ! Motion points from AD15
       !---------------------------
 
-      ! Hub node (always set)
-   ExtInfw%p%nNodesVel = 1  ! Hub is first point always
-
-      ! Blade nodes (always set)
-   DO k=1,ExtInfw%p%NumBl
-      ExtInfw%p%nNodesVel = ExtInfw%p%nNodesVel + u_AD%rotors(1)%BladeMotion(k)%NNodes
-   END DO
-
-      ! Tower motion
-   ExtInfw%p%nNodesVel = ExtInfw%p%nNodesVel + u_AD%rotors(1)%TowerMotion%NNodes
-
-      ! Nacelle motion
-   if (u_AD%rotors(1)%HubMotion%NNodes > 0) then
-      ExtInfw%p%nNodesVel = ExtInfw%p%nNodesVel + u_AD%rotors(1)%HubMotion%NNodes
-   endif
-
-      ! Tail fin nodes
-   if (u_AD%rotors(1)%TFinMotion%NNodes > 0) then
-      ExtInfw%p%nNodesVel = ExtInfw%p%nNodesVel + u_AD%rotors(1)%TFinMotion%NNodes
-   endif
+      ! Hub, blade nodes, tower nodes, nacelle and tail fin: the points AD15 reads the wind of, in its order
+   ExtInfw%p%nNodesVel = ExtInfw_NumVelNodes( u_AD%rotors(1) )
 
 
       !---------------------------
@@ -391,39 +375,9 @@ SUBROUTINE SetExtInfwPositions(p_FAST, u_AD, ExtInfw, ErrStat, ErrMsg)
    ! Do the Velocity (AeroDyn) nodes first
    !-------------------------------------------------------------------------------------------------
    
-   ! Hub
-   Node = 1 
-   if (u_AD%rotors(1)%HubMotion%Committed) then
-      ExtInfw%u%pxVel(Node) = real(u_AD%rotors(1)%HubMotion%Position(1,1) + u_AD%rotors(1)%HubMotion%TranslationDisp(1,1), c_float)
-      ExtInfw%u%pyVel(Node) = real(u_AD%rotors(1)%HubMotion%Position(2,1) + u_AD%rotors(1)%HubMotion%TranslationDisp(2,1), c_float)
-      ExtInfw%u%pzVel(Node) = real(u_AD%rotors(1)%HubMotion%Position(3,1) + u_AD%rotors(1)%HubMotion%TranslationDisp(3,1), c_float)
-   else
-      ExtInfw%u%pxVel(Node) = 0.0_c_float
-      ExtInfw%u%pyVel(Node) = 0.0_c_float
-      ExtInfw%u%pzVel(Node) = 0.0_c_float
-   end if
-
-
-   ! blade nodes
-   DO K = 1,SIZE(u_AD%rotors(1)%BladeMotion)
-      DO J = 1,u_AD%rotors(1)%BladeMotion(k)%nNodes
-
-         Node = Node + 1
-         ExtInfw%u%pxVel(Node) = real(u_AD%rotors(1)%BladeMotion(k)%TranslationDisp(1,j) + u_AD%rotors(1)%BladeMotion(k)%Position(1,j), c_float)
-         ExtInfw%u%pyVel(Node) = real(u_AD%rotors(1)%BladeMotion(k)%TranslationDisp(2,j) + u_AD%rotors(1)%BladeMotion(k)%Position(2,j), c_float)
-         ExtInfw%u%pzVel(Node) = real(u_AD%rotors(1)%BladeMotion(k)%TranslationDisp(3,j) + u_AD%rotors(1)%BladeMotion(k)%Position(3,j), c_float)
-      END DO !J = 1,p%BldNodes ! Loop through the blade nodes / elements
-   END DO !K = 1,p%NumBl
-
-   if (ExtInfw%p%NMappings .gt. ExtInfw%p%NumBl) then
-      ! tower nodes
-      DO J=1,u_AD%rotors(1)%TowerMotion%nnodes
-         Node = Node + 1
-         ExtInfw%u%pxVel(Node) = real(u_AD%rotors(1)%TowerMotion%TranslationDisp(1,J) + u_AD%rotors(1)%TowerMotion%Position(1,J), c_float)
-         ExtInfw%u%pyVel(Node) = real(u_AD%rotors(1)%TowerMotion%TranslationDisp(2,J) + u_AD%rotors(1)%TowerMotion%Position(2,J), c_float)
-         ExtInfw%u%pzVel(Node) = real(u_AD%rotors(1)%TowerMotion%TranslationDisp(3,J) + u_AD%rotors(1)%TowerMotion%Position(3,J), c_float)
-      END DO
-   end if
+   call ExtInfw_SetVelNodePositions( u_AD%rotors(1), ExtInfw%u%pxVel, ExtInfw%u%pyVel, ExtInfw%u%pzVel, ErrStat2, ErrMsg2 )
+      call SetErrStat( ErrStat2, ErrMsg2, ErrStat, ErrMsg, RoutineName )
+      if (ErrStat >= AbortErrLev) return
 
    ! Do the Actuator Force nodes now
    !-------------------------------------------------------------------------------------------------
@@ -481,6 +435,110 @@ contains
       Failed = ErrStat >= AbortErrLev
    end function Failed
 END SUBROUTINE SetExtInfwPositions
+
+!----------------------------------------------------------------------------------------------------------------------------------
+!> Number of points the external driver provides the velocity at. AD15 reads the wind of these points in a fixed order
+!! (AD_CalcWind_Rotor): the hub, the nodes of each blade, the tower nodes, the nacelle and the tail fin. The hub always takes
+!! the first point; the tower, the nacelle and the tail fin take points only when AD15 has their meshes.
+FUNCTION ExtInfw_NumVelNodes( u_ADRot ) RESULT( nNodesVel )
+   TYPE(RotInputType),             INTENT(IN   )   :: u_ADRot     ! The input meshes of one AeroDyn rotor
+   INTEGER(IntKi)                                  :: nNodesVel   ! Number of points with velocity from the external driver
+
+   INTEGER(IntKi)                                  :: K           ! Loops through blades.
+
+      ! Hub node (always set)
+   nNodesVel = 1  ! Hub is first point always
+
+      ! Blade nodes (always set)
+   DO K = 1,SIZE(u_ADRot%BladeMotion)
+      nNodesVel = nNodesVel + u_ADRot%BladeMotion(K)%NNodes
+   END DO
+
+      ! Tower nodes
+   if (u_ADRot%TowerMotion%NNodes > 0) nNodesVel = nNodesVel + u_ADRot%TowerMotion%NNodes
+
+      ! Nacelle
+   if (u_ADRot%NacelleMotion%Committed) nNodesVel = nNodesVel + 1
+
+      ! Tail fin
+   if (u_ADRot%TFinMotion%Committed) nNodesVel = nNodesVel + 1
+
+END FUNCTION ExtInfw_NumVelNodes
+
+!----------------------------------------------------------------------------------------------------------------------------------
+!> Positions of the points the external driver provides the velocity at, in the order of ExtInfw_NumVelNodes. Each point is where
+!! AD15 takes its wind to be (AD_CalcWind_Rotor): the reference position of the node plus its displacement.
+SUBROUTINE ExtInfw_SetVelNodePositions( u_ADRot, pxVel, pyVel, pzVel, ErrStat, ErrMsg )
+   TYPE(RotInputType),             INTENT(IN   )   :: u_ADRot     ! The input meshes (already calculated) of one AeroDyn rotor
+   REAL(C_FLOAT),                  INTENT(INOUT)   :: pxVel(:)    ! x position of the velocity points
+   REAL(C_FLOAT),                  INTENT(INOUT)   :: pyVel(:)    ! y position of the velocity points
+   REAL(C_FLOAT),                  INTENT(INOUT)   :: pzVel(:)    ! z position of the velocity points
+   INTEGER(IntKi),                 INTENT(  OUT)   :: ErrStat     ! Error status of the operation
+   CHARACTER(*),                   INTENT(  OUT)   :: ErrMsg      ! Error message if ErrStat /= ErrID_None
+
+      ! Local variables:
+   INTEGER(IntKi)                                  :: J           ! Loops through nodes / elements.
+   INTEGER(IntKi)                                  :: K           ! Loops through blades.
+   INTEGER(IntKi)                                  :: Node        ! Node number for blade/node on mesh
+   INTEGER(IntKi)                                  :: nNodesVel   ! Number of velocity points
+   CHARACTER(*),   PARAMETER                       :: RoutineName = 'ExtInfw_SetVelNodePositions'
+
+   ErrStat = ErrID_None
+   ErrMsg  = ""
+
+   nNodesVel = ExtInfw_NumVelNodes( u_ADRot )
+   if ( (SIZE(pxVel) /= nNodesVel) .or. (SIZE(pyVel) /= nNodesVel) .or. (SIZE(pzVel) /= nNodesVel) ) then
+      call SetErrStat( ErrID_Fatal, 'The arrays with the positions of the velocity points have '//trim(Num2LStr(SIZE(pxVel)))//', '//trim(Num2LStr(SIZE(pyVel)))//' and '//trim(Num2LStr(SIZE(pzVel)))//' entries; AeroDyn reads the wind at '//trim(Num2LStr(nNodesVel))//' points.', ErrStat, ErrMsg, RoutineName )
+      return
+   end if
+
+   ! Hub
+   Node = 1 
+   if (u_ADRot%HubMotion%Committed) then
+      pxVel(Node) = real(u_ADRot%HubMotion%Position(1,1) + u_ADRot%HubMotion%TranslationDisp(1,1), c_float)
+      pyVel(Node) = real(u_ADRot%HubMotion%Position(2,1) + u_ADRot%HubMotion%TranslationDisp(2,1), c_float)
+      pzVel(Node) = real(u_ADRot%HubMotion%Position(3,1) + u_ADRot%HubMotion%TranslationDisp(3,1), c_float)
+   else
+      pxVel(Node) = 0.0_c_float
+      pyVel(Node) = 0.0_c_float
+      pzVel(Node) = 0.0_c_float
+   end if
+
+   ! blade nodes
+   DO K = 1,SIZE(u_ADRot%BladeMotion)
+      DO J = 1,u_ADRot%BladeMotion(k)%nNodes
+         Node = Node + 1
+         pxVel(Node) = real(u_ADRot%BladeMotion(k)%TranslationDisp(1,j) + u_ADRot%BladeMotion(k)%Position(1,j), c_float)
+         pyVel(Node) = real(u_ADRot%BladeMotion(k)%TranslationDisp(2,j) + u_ADRot%BladeMotion(k)%Position(2,j), c_float)
+         pzVel(Node) = real(u_ADRot%BladeMotion(k)%TranslationDisp(3,j) + u_ADRot%BladeMotion(k)%Position(3,j), c_float)
+      END DO !J = 1,p%BldNodes ! Loop through the blade nodes / elements
+   END DO !K = 1,p%NumBl
+
+   ! tower nodes (AD15 reads their wind for the tower loads and for the influence of the tower on the blades, whether the external driver has tower force points or not)
+   DO J = 1,u_ADRot%TowerMotion%nNodes
+      Node = Node + 1
+      pxVel(Node) = real(u_ADRot%TowerMotion%TranslationDisp(1,J) + u_ADRot%TowerMotion%Position(1,J), c_float)
+      pyVel(Node) = real(u_ADRot%TowerMotion%TranslationDisp(2,J) + u_ADRot%TowerMotion%Position(2,J), c_float)
+      pzVel(Node) = real(u_ADRot%TowerMotion%TranslationDisp(3,J) + u_ADRot%TowerMotion%Position(3,J), c_float)
+   END DO
+
+   ! nacelle
+   if (u_ADRot%NacelleMotion%Committed) then
+      Node = Node + 1
+      pxVel(Node) = real(u_ADRot%NacelleMotion%Position(1,1) + u_ADRot%NacelleMotion%TranslationDisp(1,1), c_float)
+      pyVel(Node) = real(u_ADRot%NacelleMotion%Position(2,1) + u_ADRot%NacelleMotion%TranslationDisp(2,1), c_float)
+      pzVel(Node) = real(u_ADRot%NacelleMotion%Position(3,1) + u_ADRot%NacelleMotion%TranslationDisp(3,1), c_float)
+   end if
+
+   ! tail fin
+   if (u_ADRot%TFinMotion%Committed) then
+      Node = Node + 1
+      pxVel(Node) = real(u_ADRot%TFinMotion%Position(1,1) + u_ADRot%TFinMotion%TranslationDisp(1,1), c_float)
+      pyVel(Node) = real(u_ADRot%TFinMotion%Position(2,1) + u_ADRot%TFinMotion%TranslationDisp(2,1), c_float)
+      pzVel(Node) = real(u_ADRot%TFinMotion%Position(3,1) + u_ADRot%TFinMotion%TranslationDisp(3,1), c_float)
+   end if
+
+END SUBROUTINE ExtInfw_SetVelNodePositions
 
 !----------------------------------------------------------------------------------------------------------------------------------
 SUBROUTINE SetExtInfwForces(p_FAST, u_AD, y_AD, ExtInfw, ErrStat, ErrMsg)

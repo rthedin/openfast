@@ -88,6 +88,7 @@ add_test(NAME versioninfo_utest COMMAND versioninfo_utest)
 add_executable(externalinflow_utest
   ${PROJECT_SOURCE_DIR}/modules/externalinflow/tests/externalinflow_utest.F90
   ${PROJECT_SOURCE_DIR}/modules/externalinflow/tests/test_ExtInfw_LineLoadsToPoints.F90
+  ${PROJECT_SOURCE_DIR}/modules/externalinflow/tests/test_ExtInfw_VelNodes.F90
 )
 target_link_libraries(externalinflow_utest extinflowlib versioninfolib testdrivelib)
 add_test(NAME externalinflow_utest COMMAND externalinflow_utest)

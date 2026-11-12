@@ -84,6 +84,14 @@ add_executable(versioninfo_utest
 target_link_libraries(versioninfo_utest versioninfolib testdrivelib)
 add_test(NAME versioninfo_utest COMMAND versioninfo_utest)
 
+# ExternalInflow Unit Tests
+add_executable(externalinflow_utest
+  ${PROJECT_SOURCE_DIR}/modules/externalinflow/tests/externalinflow_utest.F90
+  ${PROJECT_SOURCE_DIR}/modules/externalinflow/tests/test_ExtInfw_LineLoadsToPoints.F90
+)
+target_link_libraries(externalinflow_utest extinflowlib versioninfolib testdrivelib)
+add_test(NAME externalinflow_utest COMMAND externalinflow_utest)
+
 # Custom target combining all the unit tests
 add_custom_target(
   unit_tests
@@ -93,6 +101,7 @@ add_custom_target(
     beamdyn_utest 
     aerodyn_utest 
     inflowwind_utest 
+    externalinflow_utest
 )
 
 if (AMREX_READER AND BUILD_FASTFARM)
